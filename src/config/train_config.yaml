@@ -1,0 +1,3 @@
+defaults:
+  - experiment: egosteer_qwen3_vl
+  - _self_

@@ -1,0 +1,69 @@
+EgoSteer
+Copyright 2026 The EgoSteer Authors
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this project except in compliance with the License. You may obtain a copy of
+the License at http://www.apache.org/licenses/LICENSE-2.0.
+
+================================================================================
+Third-Party Software
+================================================================================
+
+This repository incorporates or adapts source code from the third-party
+projects below. We gratefully acknowledge their authors. Each project is
+distributed under its own license.
+
+--------------------------------------------------------------------------------
+openpi — Apache License 2.0
+https://github.com/Physical-Intelligence/openpi
+Copyright Physical Intelligence
+
+--------------------------------------------------------------------------------
+diffusion_policy — MIT License
+https://github.com/real-stanford/diffusion_policy
+Copyright (c) 2023 Columbia Artificial Intelligence and Robotics Lab
+
+--------------------------------------------------------------------------------
+Hugging Face Transformers — Apache License 2.0
+https://github.com/huggingface/transformers
+Copyright The HuggingFace Inc. team
+
+--------------------------------------------------------------------------------
+PyTorch3D — BSD 3-Clause License
+https://github.com/facebookresearch/pytorch3d
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+--------------------------------------------------------------------------------
+transforms3d — BSD 2-Clause License
+https://github.com/matthew-brett/transforms3d
+Copyright (c) Matthew Brett and contributors
+
+--------------------------------------------------------------------------------
+TorchTitan — BSD 3-Clause License
+https://github.com/pytorch/torchtitan
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+--------------------------------------------------------------------------------
+TorchTNT — BSD 3-Clause License
+https://github.com/pytorch/tnt
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+--------------------------------------------------------------------------------
+kornia — Apache License 2.0
+https://github.com/kornia/kornia
+Copyright the Kornia authors
+
+--------------------------------------------------------------------------------
+pytorch_HMR — no explicit license declared
+https://github.com/MandyMo/pytorch_HMR
+
+================================================================================
+Pretrained Models and Assets
+================================================================================
+
+EgoSteer builds on the following pretrained models and assets, each governed by
+its own license:
+
+- Qwen3-VL (Apache-2.0)          — https://github.com/QwenLM/Qwen3-VL
+- DINOv3 (DINOv3 License)        — https://github.com/facebookresearch/dinov3
+- MANO (non-commercial research) — https://mano.is.tue.mpg.de

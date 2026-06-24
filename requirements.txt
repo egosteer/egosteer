@@ -1,0 +1,25 @@
+hydra-core
+omegaconf
+wandb
+tqdm
+numpy
+zarr  # legacy data build/conversion/visualization utilities
+transformers==5.6.2
+einops
+imageio
+Pillow
+opencv-python
+albumentations
+PyRender
+trimesh
+manotorch @ git+https://github.com/lixiny/manotorch.git
+scipy
+matplotlib
+seaborn
+xformers==0.0.35 # for torch 2.10.0
+websockets
+msgpack
+scikit-learn
+webdataset
+dill
+psutil

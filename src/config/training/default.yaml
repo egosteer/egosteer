@@ -1,0 +1,85 @@
+# @package _global_
+
+flow:
+  num_parallel_t: 4
+  sig_min: 0.001
+  sampling: beta
+  alpha: 1.5
+  beta: 1.0
+  num_inference_steps: 10
+
+training:
+  # Infinite WebDataset stream: run length is counted in optimizer update steps, not epochs.
+  steps_per_epoch: 240000            # CONFIRM: update steps per epoch block; run length = steps_per_epoch * num_epochs
+  seed: 42
+  dynamic_data_seed: True
+  debug: False
+  profile: False 
+  resume: False
+  lr_scheduler: cosine
+  lr_warmup_steps: 2000
+  vlm_freeze_steps: 0              # update steps to train only random-init params before VLM joins optimization (0 = no staged freeze)
+  vlm_rewarmup_steps: 0            # VLM-only warmup steps after freeze ends (0 = instant restore to base VLM lr)
+  train_vlm: True
+  train_depth: False
+  resume_checkpoint_path: 
+  finetune_checkpoint_path:                                       # CONFIRM: EgoSteer-3B model_bf16.pt to fine-tune from; leave empty to train from scratch
+  normalizer_path: outputs/normalizer/example/normalizer.pkl      # CONFIRM: normalizer fitted to your data; see the Normalizer section in data.md
+  max_train_steps: null
+  max_eval_steps: null
+  num_epochs: 2                # CONFIRM: number of steps_per_epoch blocks to run
+  gradient_accumulation_steps: 1   # number of micro-batches to accumulate before each optimizer step (1 = disabled)
+  fsdp:
+    enable_prefetch: True
+    reshard_after_forward: False
+  use_bf16: True
+  log_interval: 20
+  eval_thresholds: [0.05, 0.1, 0.2, 0.3, 0.5]
+  save_eval_attn_weights: False
+  eval_every: 5000             # CONFIRM: run evaluation every N update steps
+  checkpoint_every: 5000       # CONFIRM: save top-k checkpoint every N steps; keep a multiple of eval_every so eval/l1_loss is available
+  ckpt_save_interval: 10000    # CONFIRM: save a periodic checkpoint every N steps
+  clipping:
+    enabled: True
+    max_grad_norm: 1.0
+  compile:
+    enabled: True  # Set True to compile the fixed block stacks.
+    fullgraph: False  # Start with False for dynamic multimodal training workloads.
+    backend: inductor  # Default PyTorch compiler backend for CUDA workloads.
+    mode: default  # Good starting point. Try reduce-overhead mainly for stable inference-like shapes.
+    dynamic:  # Leave null for the PyTorch default. Set True only when variable shapes cause recompiles.
+    vision: True  # Keep vision blocks on by default.
+    text: True  # Keep text decoder blocks on by default.
+    flow: True  # Keep action-expert blocks on by default.
+    world_model: True  # Compile world model expert + frozen DINOv3 teacher (no_grad) when use_world_model.
+  # Per-component gradient checkpointing. Set to plain `False` to disable all,
+  # or `True` to enable all with every_n=1 (backward compatible).
+  gradient_checkpointing:
+    text:
+      enabled: False
+      every_n: 2           # checkpoint every N-th text layer (1 = all layers)
+    vision:
+      enabled: False
+      every_n: 1           # checkpoint every N-th vision block (1 = all blocks)
+    action_expert:
+      enabled: False
+      every_n: 1           # checkpoint every N-th action expert layer
+optimizer:
+  # CONFIRM: per-component learning rates, tuned for pretraining from scratch.
+  # When fine-tuning from a released EgoSteer checkpoint, lower every lr by roughly 10x.
+  action:
+    lr: 3e-4
+    betas: [0.9, 0.95]
+    weight_decay: 1e-2
+  vlm:
+    lr: 1e-4
+    betas: [0.9, 0.95]
+    weight_decay: 5e-3
+  ar_action_heads:
+    lr: 8e-4
+    betas: [0.9, 0.95]
+    weight_decay: 1e-2
+  world_model:
+    lr: 3e-4
+    betas: [0.9, 0.95]
+    weight_decay: 1e-2

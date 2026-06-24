@@ -1,0 +1,31 @@
+# @package _global_
+
+logging:
+  project: egosteer
+  entity: null
+  resume: False
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M}_${name}_${hydra:runtime.choices.experiment}
+  tags: ["${name}", "${hydra:runtime.choices.experiment}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: eval/l1_loss
+    mode: min
+    k: 1
+    format_str: update_step={update_step:04d}
+  save_last_ckpt: False
+
+multi_run:
+  run_dir: outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${hydra:runtime.choices.experiment}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${hydra:runtime.choices.experiment}
+  sweep:
+    dir: outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${hydra:runtime.choices.experiment}
+    subdir: ${hydra.job.num}

@@ -1,0 +1,17 @@
+# @package _global_
+#
+# WebDataset shard paths for VLM training.
+#
+# Empty by default: the example runs VLA-only. The VLM branch is disabled in
+# src/config/data/unified_wds.yaml (vlm_dataset: null, vla_ratio: 1), so these
+# empty lists are not consumed.
+#
+# To enable VLA + VLM joint training:
+#   1. Add entries below (same schema as vla_wds_datasets: name / shard_urls / weight).
+#   2. In unified_wds.yaml, set dataset.vlm_dataset back to a VLMWdsDataset block
+#      (wds_datasets: ${vlm_wds_datasets}) and lower vla_ratio below 1.
+# Note: a VLMWdsDataset with an empty shard list raises "No shards found", so keep
+# vlm_dataset null whenever these lists are empty.
+#
+vlm_wds_datasets: []
+val_vlm_wds_datasets: []

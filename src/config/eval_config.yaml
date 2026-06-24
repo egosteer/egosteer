@@ -1,0 +1,31 @@
+# Offline dataset evaluation for EgoSteer flow matching.
+#
+# Required overrides:
+#   checkpoint_path: path to a saved DCP checkpoint directory
+#   train_config_path: path to the training run's .hydra/config.yaml
+#   normalizer_path: path to the normalizer used for training/finetuning
+
+# Model loading
+checkpoint_path: outputs/<your-run>/checkpoints/update_step=10000
+train_config_path: outputs/<your-run>/.hydra/config.yaml
+normalizer_path: outputs/normalizer/example/normalizer.pkl
+
+# Evaluation settings
+output_dir: outputs/eval_dataset
+num_shards: 10
+num_samples: 200
+batch_size: 16
+device: cuda
+seed: 42
+num_workers: 10               # keep <= num_shards; extra workers are idle with val-mode shard splitting
+flow_steps: null              # override flow inference steps (null = use training config value)
+inference_delay: 0            # RTC test: pin first N GT action steps as prefix (0 = disabled)
+
+# 2D visualization and HTML report settings
+vis_action_stride: 4          # draw every N-th action timestep in 2D overlay
+generate_html_report: true    # generate self-contained HTML report with metrics + vis
+
+# Datasets to evaluate (same schema as vla_wds_datasets entries)
+eval_datasets:
+  - name: example_val
+    shard_urls: example_data/vla/val/shard-*.tar

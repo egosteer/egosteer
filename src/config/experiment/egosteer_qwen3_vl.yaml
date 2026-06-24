@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - /model: qwen3_vl_2b
+  - /data: unified_wds
+  - /training: default
+  - /logging: default
+  - /dataset_paths/vla_wds
+  - /dataset_paths/vlm_wds
+  - /world_model: frozen_regression
+  - _self_
+
+name: egosteer_qwen3_vl
+exp_name: egosteer_qwen3_vl
+_target_: src.workspace.train_egosteer_workspace.TrainEgoSteerWorkspace

@@ -1,0 +1,142 @@
+# @package _global_
+
+pretrained:
+  model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
+  trust_remote_code: True
+  torch_dtype: bfloat16
+  # Attention backend used by the Qwen3-VL text tower and the Qwen3 action expert.
+  # Valid values in transformers 5.3.0: eager, sdpa, flash_attention_2, flash_attention_3.
+  # Use `sdpa` for text/action blocks to keep torch.compile-friendly dispatch.
+  text_attn_implementation: flex_attention
+  # Keep vision on FA2 because the upstream sdpa fallback splits ragged visual sequences in Python.
+  vision_attn_implementation: flash_attention_2
+
+added_slot_tokens:
+  state: <state>
+  action: <action>
+  camera: null
+
+# Camera intrinsic input mode:
+#   "text"  — intrinsic as formatted text in the prompt (default, backward-compatible)
+#   "token" — intrinsic encoded via camera_encoder and injected as <camera> slot token
+camera_intrinsic_mode: text
+
+dims:
+  vlm_hidden_size: 2048
+  action_hidden_size: 1024
+  time_hidden_size: 1024
+  action_dim: 48
+  state_dim: 48
+
+policy:
+  _target_: src.policy.egosteer.EgoSteer
+  backbone:
+    _target_: src.model.vlm.qwen3_vl_backbone.Qwen3VLBackboneWrapper
+    model_name_or_path: ${pretrained.model_name_or_path}
+    trust_remote_code: ${pretrained.trust_remote_code}
+    freeze_backbone: False
+    torch_dtype: ${pretrained.torch_dtype}
+    state_token: ${added_slot_tokens.state}
+    action_token: ${added_slot_tokens.action}
+    camera_token: ${added_slot_tokens.camera}
+    text_attn_implementation: ${pretrained.text_attn_implementation}
+    vision_attn_implementation: ${pretrained.vision_attn_implementation}
+  camera_intrinsic_mode: ${camera_intrinsic_mode}
+  # Camera encoder: only used when camera_intrinsic_mode=token.
+  # Encodes [fx, fy, cx, cy] (4D) into a single <camera> slot embedding.
+  # Encodes the continuous camera parameters into a single token, keeping the
+  # intrinsic directly instead of converting it to FOV first.
+  camera_encoder: null
+    # _target_: src.model.action.action_head.MLPEncoder
+    # action_dim: 4
+    # width: ${dims.vlm_hidden_size}
+    # time_cond: False
+    # mlp_depth: 2
+    # final_layer_norm: False
+    # use_mlp_layer_norm: False
+  state_encoder:
+    _target_: src.model.action.action_head.MLPEncoder
+    action_dim: ${dims.state_dim}
+    width: ${dims.vlm_hidden_size}
+    time_cond: False
+    mlp_depth: 2
+    final_layer_norm: False
+    use_mlp_layer_norm: False
+  action_encoder:
+    _target_: src.model.action.action_head.MLPEncoder
+    action_dim: ${dims.action_dim}
+    width: ${dims.action_hidden_size}
+    time_cond: False
+    mlp_depth: 2
+    final_layer_norm: False
+    use_mlp_layer_norm: False
+  time_embedding:
+    _target_: src.model.common.modules.TimeEmbedding
+    time_hidden_size: ${dims.time_hidden_size}
+    min_period: 0.004
+    max_period: 4.0
+  flow_expert:
+    _target_: src.model.vlm.qwen3_expert.Qwen3Expert
+    model_name_or_path: ${pretrained.model_name_or_path}
+    use_adaln: True
+    cond_hidden_size: ${dims.time_hidden_size}
+    hidden_size: ${dims.action_hidden_size}
+    intermediate_size: 2816
+    num_heads: 8
+    num_layers: 14
+    detach_prefix_kv: False
+    attn_implementation: ${pretrained.text_attn_implementation}
+    trust_remote_code: ${pretrained.trust_remote_code}
+    use_kv_projection: True
+  action_decoder:
+    _target_: src.model.action.action_head.MLPDecoder
+    input_dim: ${dims.action_hidden_size}
+    output_dim: ${dims.action_dim}
+    width: ${dims.action_hidden_size}
+    depth: 2
+    final_layer_norm: False
+    use_mlp_layer_norm: False
+  shape_meta: ${data.shape_meta}
+  ignore_index: ${data.ignore_index}
+  action_hidden_size: ${dims.action_hidden_size}
+  flow_config:
+    _target_: src.policy.egosteer.FlowConfig
+    sig_min: ${flow.sig_min}
+    num_parallel_t: ${flow.num_parallel_t}
+    sampling: ${flow.sampling}
+    alpha: ${flow.alpha}
+    beta: ${flow.beta}
+    num_inference_steps: ${flow.num_inference_steps}
+  rtc_config:
+    _target_: src.policy.egosteer.RTCConfig
+    # Keep off for pretraining. Enable for real-robot fine-tuning when using training-time RTC.
+    enabled: False
+    delay_strategy: uniform
+    max_delay: 6
+  ar_action_train_config:
+    _target_: src.policy.egosteer.ARActionTrainConfig
+    input_mask_enabled: True
+    state_mask:
+      _target_: src.policy.egosteer.StateMaskConfig
+      mask_prob: 0.75
+      keep_last: True
+      p_no_mask: 0.05
+  loss_config:
+    _target_: src.policy.egosteer.LossConfig
+    ce_loss_weight: 0.05
+    flow_loss_weight: 1.0
+    wm_loss_weight: 1.0
+  # World model (conditionally instantiated from world_model config group)
+  world_model_expert: ${world_model.world_model_expert}
+  frozen_teacher: ${world_model.frozen_teacher}
+  wm_action_encoder: ${world_model.wm_action_encoder}
+  wm_motion_encoder: ${world_model.wm_motion_encoder}
+  world_model_config:
+    _target_: src.policy.egosteer.WorldModelConfig
+    num_future_frames: ${world_model.future_frame.horizon}
+    target_image_size: ${world_model.teacher_image_size}
+    teacher_patch_size: ${world_model.teacher_patch_size}
+    upsample_factor: ${world_model.upsample_factor}
+    action_conditioning: ${world_model.action_conditioning}
+    motion_conditioning: ${world_model.motion_conditioning}
+    mask_loss_by_view_mask: ${world_model.mask_loss_by_view_mask}

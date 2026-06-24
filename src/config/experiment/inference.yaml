@@ -1,0 +1,74 @@
+# @package _global_
+# Serving config. Before launching, edit the fields marked "EDIT" below to match
+# your checkpoint; "EDIT (must match training)" fields must equal the values the
+# policy was trained with.
+defaults:
+  - _self_
+
+serving:
+  host: 0.0.0.0                           # EDIT: bind address
+  port: 8765                              # EDIT: serving port
+  device: cuda
+  autocast: True
+  warmup_enabled: True
+  warmup_iters: 3
+  warmup_instruction: "pick up the object"
+  warmup_image_shape: [384, 384, 3]       # EDIT (must match training): image size the policy was trained on
+  warmup_depth_shape: [384, 384, 3]       # EDIT (must match training): depth payload shape, only if depth inputs are enabled
+  warmup_intrinsic: [500.0, 500.0, 320.0, 240.0]
+  # Warmup payload modality/camera setup for RuntimeEngine._build_dummy_obs.
+  # Keep aligned with env_wrapper below to avoid first-request recompilation.
+  warmup_camera_setup_mode: both          # EDIT (must match training): `single` or `both`, the camera setup used at inference
+  warmup_image_mode: rgb
+  log_obs_details: True
+  record_enabled: True
+  record_root_dir: outputs/serving_records
+  profile_enabled: False
+  profile_dir: outputs/serving_profile
+  profile_steps: 5
+  profile_skip_first: 5
+  flops_count_enabled: False
+
+policy:
+  _target_: src.policy.egosteer_inference_wrapper.EgoSteerInference
+  # EDIT: training config of the run that produced this checkpoint.
+  model_config_path: /root/workspace/checkpoints/egosteer-realman/config.yaml
+  # EDIT: DCP checkpoint dir or a single .pt file from that same run.
+  checkpoint_path: /root/workspace/checkpoints/egosteer-realman/model_bf16.pt
+  # EDIT: Qwen3-VL weights dir; null keeps the path stored in model_config_path.
+  pretrained_vlm_path: /root/workspace/checkpoints/Qwen3-VL-2B-Instruct
+  # EDIT: DINOv3 teacher weights dir; null keeps the training config value.
+  teacher_path: /root/workspace/checkpoints/dinov3-vitl16-pretrain-lvd1689m
+  use_mixed_precision: True
+  tokenizer_padding: max_length
+  # EDIT (must match training): equal to data.max_vlm_tokens used in training.
+  max_length: 2176
+  default_instruction: null
+  flow_sampling_steps: 10
+  # EDIT: normalizer used for training/finetuning this checkpoint.
+  normalizer_path: /root/workspace/checkpoints/egosteer-realman/normalizer-relative-10k-pretrain/normalizer.pkl
+  use_relative_action: True
+  attention_recording: False
+  compile:
+    enabled: True
+    fullgraph: False       # allow graph breaks in backbone multimodal processing
+    backend: inductor
+    mode: default
+
+env_wrapper:
+  enabled: True
+  # EDIT (must match training): deployed observation format / camera setup.
+  # single: legacy single-camera payload
+  # both: dual-camera payload
+  camera_setup_mode: both
+  # rgb: ignore depth payload
+  # rgbd: read depth payload using depth_key
+  image_mode: rgb
+  head_camera_name: head
+  chest_camera_name: chest
+  image_key: image
+  depth_key: depth_image
+  intrinsic_key: camera_intrinsics
+  instruction_key: instruction
+  states_key: states
+  prev_action_chunk_key: action_rtc

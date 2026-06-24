@@ -1,0 +1,60 @@
+# @package _global_
+world_model:
+  enabled: true
+  future_frame:
+    horizon: 1
+    stride: 30    # predict frame ~1 second ahead (at 30fps base)
+  frozen_teacher:
+    _target_: src.model.world_model.frozen_teacher.FrozenVisualTeacher
+    # DINOv3-ViT-L/16: patch_size=16, hidden_size=1024, 4 register tokens, RoPE.
+    # Native multi-resolution support, 384/16=24 → 576 spatial tokens.
+    model_name_or_path: facebook/dinov3-vitl16-pretrain-lvd1689m
+    feature_dim: 1024
+    torch_dtype: bfloat16
+    target_size: ${world_model.teacher_image_size}
+
+  world_model_expert:
+    _target_: src.model.vlm.qwen3_expert.Qwen3Expert
+    model_name_or_path: ${pretrained.model_name_or_path}
+    use_adaln: false
+    cond_hidden_size: null
+    detach_prefix_kv: false
+    num_layers: 4
+    hidden_size: 1024
+    intermediate_size: 4096
+    num_heads: 8
+    use_kv_projection: true
+    attn_implementation: ${pretrained.text_attn_implementation}
+    trust_remote_code: ${pretrained.trust_remote_code}
+
+  # DINOv3-ViT-L/16: patch_size=16, 384/16=24 spatial grid (exact).
+  # grid = 384 / (16 * 2) = 12 → 12x12 = 144 query tokens per frame.
+  # Upsampled to 24x24 = 576 = DINOv3 spatial tokens at 384x384.
+  teacher_image_size: [384, 384]
+  teacher_patch_size: 16
+  upsample_factor: 2
+  action_conditioning: true
+  motion_conditioning: true
+  # When true, video dropout also masks WM loss for dropped views.
+  # Set false to supervise WM on both head and chest future frames regardless
+  # of which input views were dropped.
+  mask_loss_by_view_mask: true
+
+  # Dedicated WM action encoder (clean-action domain; no sharing with flow expert).
+  wm_action_encoder:
+    _target_: src.model.action.action_head.MLPEncoder
+    action_dim: ${dims.action_dim}
+    width: ${world_model.world_model_expert.hidden_size}
+    time_cond: False
+    mlp_depth: 2
+    final_layer_norm: False
+    use_mlp_layer_norm: False
+  # 4x4 relative extrinsic flattened to 16D per future step.
+  wm_motion_encoder:
+    _target_: src.model.action.action_head.MLPEncoder
+    action_dim: 16
+    width: ${world_model.world_model_expert.hidden_size}
+    time_cond: False
+    mlp_depth: 2
+    final_layer_norm: False
+    use_mlp_layer_norm: False

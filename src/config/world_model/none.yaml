@@ -1,0 +1,16 @@
+# @package _global_
+world_model:
+  enabled: false
+  future_frame:
+    horizon: 0
+    stride: 1
+  frozen_teacher: null
+  world_model_expert: null
+  teacher_image_size: null
+  teacher_patch_size: 16
+  upsample_factor: 2
+  action_conditioning: false
+  motion_conditioning: false
+  mask_loss_by_view_mask: true
+  wm_action_encoder: null
+  wm_motion_encoder: null

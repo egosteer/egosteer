@@ -1,0 +1,17 @@
+# @package _global_
+#
+# WebDataset shard paths for VLA training.
+# Point these at your own dataset; see README for the example_data layout.
+#
+
+wds_base_dir: example_data/vla
+
+# Shuffle buffer is shared after RandomMix, so subset count does not affect memory.
+vla_wds_datasets:
+  - name: example
+    shard_urls: ${wds_base_dir}/train/shard-*.tar
+    weight: 1
+
+val_vla_wds_datasets:
+  - name: example_val
+    shard_urls: ${wds_base_dir}/val/shard-*.tar

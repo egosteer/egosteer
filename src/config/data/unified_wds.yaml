@@ -1,0 +1,163 @@
+# @package _global_
+
+data:
+  # Target image size [H, W] for resizing all RGB images (VLA + VLM) before HF processor.
+  # When world model (future frame prediction) is enabled, this MUST be set
+  # to ensure temporal attention patches align across frames.
+  # Set to null to skip resizing (original resolution preserved).
+  target_image_size: [384, 384]
+  # H * W; used as min_pixels / max_pixels below as a smart_resize fail-safe.
+  target_pixels: ${eval:'${data.target_image_size}[0] * ${data.target_image_size}[1]'}
+  ignore_index: -100
+  max_vlm_tokens: 768
+  tokenizer_padding: max_length
+  depth_clip_range: [0.0, 5.0]
+  video_base_fps: 30.0
+  # DAgger: drop hq=0 anchor windows; suffix-truncate action/WM at first hq=0.
+  # Missing high_quality key defaults to 1 (no-op on legacy data).
+  dagger_quality_filter: true
+  sanity_checks:
+    rot6d:
+      orthogonality_threshold: 0.1
+    state_action_delta:
+      wrist_translation_threshold: 2.5
+      wrist_rotation_threshold: 10.0
+      fingertips_displacement_threshold: 2.5
+  # Sampling contract: WindowConfig reads horizons/strides/pad_modes from here.
+  # history_pad_mode covers obs; action + future_frame each carry their own pad_mode.
+  shape_meta:
+    history_pad_mode: repeat
+    obs:
+      rgb:
+        type: rgb
+        horizon: 6
+        stride: 30
+      depth:
+        shape: [224, 224]
+        type: depth
+        horizon: 0
+        stride: 1
+      state:
+        wrist:
+          shape: [18]
+        hand:
+          shape: [30]
+        shape:
+          - ${dims.state_dim}
+        type: fingertips
+        horizon: 6
+        stride: 30
+    action:
+      shape:
+        - ${dims.action_dim}
+      type: fingertips
+      horizon: 32
+      stride: 1
+      pad_mode: truncate
+    future_frame:
+      horizon: ${world_model.future_frame.horizon}
+      stride: ${world_model.future_frame.stride}
+      pad_mode: repeat
+
+dataset:
+  _target_: src.dataset.vla_dataset.UnifiedWdsDataset
+  vla_dataset:
+    _target_: src.dataset.vla_dataset.VLAWdsDataset
+    wds_datasets: ${vla_wds_datasets}
+    shape_meta: ${data.shape_meta}
+    use_relative_action: True
+    depth_clip_range: ${data.depth_clip_range}
+    val_wds_datasets: ${val_vla_wds_datasets}
+    shuffle_buffer: 16384
+    # Warmup samples required before the train shuffle yields anything.
+    # Keep much smaller than shuffle_buffer when keep_ratio < 1.0; otherwise
+    # startup must read roughly shuffle_buffer / keep_ratio candidates per worker.
+    shuffle_initial: 4096
+    video_base_fps: ${data.video_base_fps}
+    target_image_size: ${data.target_image_size}
+    # When training does not need depth, skip depth reading entirely at the
+    # tar layer (also disables augment_depth downstream).
+    load_depth: ${training.train_depth}
+    # Decode chest camera when real-robot shards declare it.
+    # Model side still ignores these keys; set true only once downstream is ready.
+    load_chest: false
+    # Per-sample training-time view dropout for dual-camera samples.
+    # Validation and samples without chest video always keep the available views.
+    view_dropout:
+      _target_: src.dataset.vla_dataset.ViewDropoutConfig
+      drop_head: 0.0
+      drop_chest: 0.0
+    # Pre-shuffle Bernoulli keep rate (train only). Lower = more shard diversity,
+    # higher IO. 1.0 disables. Ref: DreamZero shard_sampling_rate.
+    keep_ratio: 0.2
+    sanity_checks: ${data.sanity_checks}
+    dagger_quality_filter: ${data.dagger_quality_filter}
+  # VLM branch disabled for the example (VLA-only training).
+  # UnifiedWdsDataset streams pure VLA when vlm_dataset is None.
+  vlm_dataset: null
+  vla_ratio: 1
+  batch_size: ${dataloader.loader.batch_size}
+
+data_collator:
+  _target_: src.dataset.unified_vla_collator.UnifiedVLACollator
+  formatter:
+    _target_: src.dataset.qwen3_vl_batching.Qwen3VLChatFormatter
+    state_token: ${added_slot_tokens.state}
+    action_token: ${added_slot_tokens.action}
+    camera_token: ${added_slot_tokens.camera}
+    camera_intrinsic_mode: ${camera_intrinsic_mode}
+    predict_future_frames: ${world_model.enabled}
+  batch_processor:
+    _target_: src.dataset.qwen3_vl_batching.Qwen3VLBatchProcessor
+    model_name_or_path: ${pretrained.model_name_or_path}
+    processor_init_kwargs:
+      trust_remote_code: ${pretrained.trust_remote_code}
+    processor_call_kwargs:
+      # Fail-safe cap: smart_resize is a no-op on already-resized images.
+      min_pixels: ${data.target_pixels}
+      max_pixels: ${data.target_pixels}
+      text_kwargs:
+        padding: ${data.tokenizer_padding}
+        max_length: ${data.max_vlm_tokens}
+        truncation: True
+        return_tensors: pt
+    ignore_index: ${data.ignore_index}
+    padding_side: right
+    state_token: ${added_slot_tokens.state}
+    action_token: ${added_slot_tokens.action}
+    camera_token: ${added_slot_tokens.camera}
+
+# Dataloader host-memory tuning:
+# PyTorch's CachingHostAllocator caches pinned pages and never returns them
+# to the OS, so DataLoader with pin_memory=True + high prefetch_factor
+# accumulates host RSS in long-running training. For train we reduce
+# prefetch_factor to keep the pinned pool water level small; for val we
+# fully disable pin_memory because each eval's tensor shape distribution
+# triggers fresh cudaHostAlloc buckets that then stick around forever.
+# Refs:
+#   https://github.com/pytorch/pytorch/issues/97432
+#   https://github.com/pytorch/pytorch/issues/106606
+#   https://github.com/pytorch/pytorch/issues/134332
+dataloader:
+  # Switch between plain DataLoader (default) and WebLoader with cross-worker
+  # shuffle. When use_webloader=true, cross_worker_shuffle > 0 enables a
+  # post-round-robin shuffle buffer to de-correlate batches across workers.
+  webloader:
+    use_webloader: false
+    cross_worker_shuffle: 0
+  loader:
+    batch_size: 18
+    num_workers: 4
+    pin_memory: True
+    persistent_workers: True
+    prefetch_factor: 4
+
+val_dataloader:
+  loader:
+    batch_size: 18
+    shuffle: False
+    drop_last: False
+    num_workers: 4
+    pin_memory: False
+    persistent_workers: False
+    prefetch_factor: 2
