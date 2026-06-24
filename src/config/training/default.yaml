@@ -23,7 +23,7 @@ training:
   train_vlm: True
   train_depth: False
   resume_checkpoint_path: 
-  finetune_checkpoint_path:                                       # CONFIRM: EgoSteer-3B model_bf16.pt to fine-tune from; leave empty to train from scratch
+  finetune_checkpoint_path:                                       # CONFIRM: EgoSteer-3B-Base model_bf16.pt to fine-tune from; leave empty to train from scratch
   normalizer_path: outputs/normalizer/example/normalizer.pkl      # CONFIRM: normalizer fitted to your data; see the Normalizer section in data.md
   max_train_steps: null
   max_eval_steps: null

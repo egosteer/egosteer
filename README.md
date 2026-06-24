@@ -73,12 +73,12 @@ Set the **DINOv3** path in:
 - `world_model.frozen_teacher.model_name_or_path` in [frozen_regression.yaml](src/config/world_model/frozen_regression.yaml)
 - `policy.teacher_path` in [inference.yaml](src/config/experiment/inference.yaml)
 
-We also release the trained EgoSteer models below. Use **EgoSteer-3B** as the base for fine-tuning on your own data, and **EgoSteer-RealMan-3B** for off-the-shelf deployment on the RealMan robot.
+We also release the trained EgoSteer models below. Use **EgoSteer-3B-Base** as the base for fine-tuning on your own data, and **EgoSteer-3B-RealMan** for off-the-shelf deployment on the RealMan robot.
 
 | Model Type | Model Name | Parameters | Description |
 |------------|------------|------------|-------------|
-| **EgoSteer Pretrained** | [EgoSteer-3B](https://huggingface.co/EgoSteer/EgoSteer-3B) | 3B | Base EgoSteer model trained on 9.6k hours of egocentric human videos, ready for fine-tuning |
-| **EgoSteer Generalist** | [EgoSteer-RealMan-3B](https://huggingface.co/EgoSteer/EgoSteer-RealMan-3B) | 3B | A generalist model post-trained on real-world data collected on the RealMan robot |
+| **EgoSteer Pretrained** | [EgoSteer-3B-Base](https://huggingface.co/EgoSteer/EgoSteer-3B-Base) | 3B | Base EgoSteer model trained on 9.6k hours of egocentric human videos, ready for fine-tuning |
+| **EgoSteer Generalist** | [EgoSteer-3B-RealMan](https://huggingface.co/EgoSteer/EgoSteer-3B-RealMan) | 3B | A generalist model post-trained on real-world data collected on the RealMan robot |
 
 ## Quick Start
 
@@ -140,7 +140,7 @@ environment variables, and uses [numa_bind_wrapper.sh](scripts/numa_bind_wrapper
 ## Fine-tuning with Your Own Data
 
 To adapt EgoSteer to your own data or embodiment, fine-tune from the released
-**EgoSteer-3B** weights.
+**EgoSteer-3B-Base** weights.
 
 **1. Prepare your data and normalizer.** Convert your data to the EgoSteer
 WebDataset format and compute a normalizer over it. See [`data.md`](data/data.md)
@@ -157,16 +157,16 @@ released one. The exception is when the target robot is a humanoid whose
 embodiment gap from humans is small: because the action space is the unified
 human-to-robot representation, you can then reuse the pre-computed normalizer
 directly and skip [compute_norm_stats.sh](scripts/compute_norm_stats.sh). The pre-computed normalizer is provided 
-alongside **EgoSteer-3B** in the same Hugging Face repository as `normalizer.pkl`.
+alongside **EgoSteer-3B-Base** in the same Hugging Face repository as `normalizer.pkl`.
 
-**2. Download the base model.** Get `model_bf16.pt` for [EgoSteer-3B](https://huggingface.co/EgoSteer/EgoSteer-3B) from
+**2. Download the base model.** Get `model_bf16.pt` for [EgoSteer-3B-Base](https://huggingface.co/EgoSteer/EgoSteer-3B-Base) from
 Hugging Face.
 
 **3. Configure the run.** In [default.yaml](src/config/training/default.yaml):
 
 ```yaml
 training:
-  finetune_checkpoint_path: /path/to/model_bf16.pt        # the downloaded EgoSteer-3B weights
+  finetune_checkpoint_path: /path/to/model_bf16.pt        # the downloaded EgoSteer-3B-Base weights
   normalizer_path: /path/to/your/normalizer.pkl
 ```
 
