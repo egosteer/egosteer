@@ -294,6 +294,21 @@ docker pull egosteerai/inference-server:latest
 bash scripts/run_server.sh
 ```
 
+If Docker Hub is unavailable in your network, pull the same image from another
+registry and tag it as the default image name used by `create_container.sh`:
+
+```bash
+docker pull docker-registry.psibot.net/egosteer/inference-server:latest
+docker tag docker-registry.psibot.net/egosteer/inference-server:latest egosteerai/inference-server:latest
+```
+
+or:
+
+```bash
+docker pull ghcr.io/egosteer/inference-server:latest
+docker tag ghcr.io/egosteer/inference-server:latest egosteerai/inference-server:latest
+```
+
 You can also build docker from `Dockerfile` with `docker build -t egosteerai/inference-server:1.0.0 -t egosteerai/inference-server:latest .`
 
 The checkpoint root passed as the second argument is mounted to
