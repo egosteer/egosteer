@@ -254,10 +254,9 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
         if hasattr(dataset.vla_dataset, "resume_enabled"):
             if use_webloader or not cfg.dataloader.loader.get("in_order", True):
                 raise ValueError("LeRobot data resume requires the plain, in-order DataLoader")
-            from src.dataset.lerobot.lerobot_dataset import StreamCheckpoint, MixedStreamCheckpoint
-            checkpoint_type = StreamCheckpoint if dataset.vlm_dataset is None else MixedStreamCheckpoint
+            from src.dataset.lerobot.lerobot_dataset import StreamCheckpoint
             checkpoint_dataset = dataset.vla_dataset if dataset.vlm_dataset is None else dataset
-            self.data_stream = checkpoint_type(
+            self.data_stream = StreamCheckpoint(
                 checkpoint_dataset, batch_size=cfg.dataloader.loader.batch_size,
                 num_workers=cfg.dataloader.loader.num_workers, rank=rank, world_size=world_size,
                 micro_batches_per_epoch=int(cfg.training.get("steps_per_epoch", 100000))
@@ -561,7 +560,9 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                     if cfg.training.profile and torch.cuda.is_available():
                         torch.cuda.reset_peak_memory_stats()
 
-                    stream_state = batch.pop("_stream_state", None)
+                    stream_state = (
+                        batch.pop("_stream_state", None) if data_stream is not None else None
+                    )
                     sync_gradients, step_skipped, raw_loss, part_grad_norms = self.train_step(
                         batch, batch_idx, grad_accum_steps, cfg, rank,
                     )

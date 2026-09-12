@@ -72,7 +72,7 @@ torchrun --standalone --nproc_per_node=1 train.py \
 
 默认 `batch_size=8, vla_ratio=0.75`：每个 worker 依次输出 6 条 VLA、2 条 VLM，组成一个 batch。
 计算规则与 WDS 相同：`ceil(batch_size * vla_ratio)` 条 VLA，其余为 VLM。
-两条流分别顺序遍历、shuffle，各自的预热和容量均为 4096；VLM 默认 `drop_ratio=0`。
+两条流分别顺序遍历、shuffle，各自的容量为 16384、预热为 4096；VLM 默认 `drop_ratio=0`。
 这是 VLA/VLM 的固定配额混合，不是多个 VLA 数据源之间的 RandomMix。
 
 VLM sample 的 actions/states 补零，n_states/n_actions=0，actions_valid_mask 全 false，
@@ -98,3 +98,7 @@ normalizer 仍仅由 VLA train 数据拟合；VLM 不使用另一套机器人 no
 
 验证覆盖原生 image/视频 frame、嵌套/JSON QA、WDS 评分与像素对照、混合 labels/mask，
 以及包含预取和 worker 轮转的两条流恢复。模型 tokenizer/完整 GPU 训练仍需真实数据环境验证。
+
+VLM 图像/视频先 resize 到 target_image_size，训练队列保存 resize 后的独立 JPEG quality 80 字节；QA 内容检查、评分选择和随机图像增强在出队后执行，
+与 WDS 的 preprocess 时机一致。resume 使用 version 3 描述符重建同样的压缩队列，
+恢复槽位和随机 seed 后继续消费；不保存图像载荷。

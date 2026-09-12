@@ -25,7 +25,9 @@ from ..data_transforms import (
 from ..sanity_checks import DataChecker, current_worker_id
 from ..unified_vla_collator import ConcatDataCollator
 from .wds_dataset import (
-    build_blended_dataset, build_wds_pipeline, WindowConfig,
+    build_blended_dataset,
+    build_wds_pipeline,
+    WindowConfig,
     expand_shard_patterns,
 )
 
@@ -47,6 +49,7 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
         dataset.set_normalizer(normalizer)
         dataloader = DataLoader(dataset, batch_size=20, num_workers=20)
     """
+
     def __init__(
         self,
         wds_datasets: List[Dict],
@@ -136,7 +139,7 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
 
         # process_image only checks truthiness; actual color aug lives in
         # data_transforms.COLOR_AUG (albumentations-based).
-        self.aug_transform = (self.mode == "train")
+        self.aug_transform = self.mode == "train"
 
         self.checker = DataChecker(sanity_cfg=self.sanity_checks)
 
@@ -180,9 +183,7 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
         chest_image=None,
         chest_intrinsic=None,
     ):
-        view_mask = np.array(
-            ["head" in active_views, "chest" in active_views], dtype=bool
-        )
+        view_mask = np.array(["head" in active_views, "chest" in active_views], dtype=bool)
         data = {
             "images": image,
             "instruction": instruction,
@@ -250,20 +251,32 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
         The returned mapping contains visual history, instruction text, intrinsic parameters, padded state/action
         tensors, action-valid masks, and bookkeeping fields such as `n_states`, `n_actions`, and `is_vla_data`.
         """
-        self.checker.check(sample_schema=(sample, {
-            "required_keys": (
-                "wrist_state", "hand_state", "wrist_action", "hand_action",
-                "extrinsic", "intrinsic", "instruction", "instruction_num", "image",
-            ),
-            "expected_last_dim": {
-                "wrist_state": 18,
-                "hand_state": 30,
-                "wrist_action": 18,
-                "hand_action": 30,
-                "extrinsic": 16,
-                "intrinsic": 4,
-            },
-        }))
+        self.checker.check(
+            sample_schema=(
+                sample,
+                {
+                    "required_keys": (
+                        "wrist_state",
+                        "hand_state",
+                        "wrist_action",
+                        "hand_action",
+                        "extrinsic",
+                        "intrinsic",
+                        "instruction",
+                        "instruction_num",
+                        "image",
+                    ),
+                    "expected_last_dim": {
+                        "wrist_state": 18,
+                        "hand_state": 30,
+                        "wrist_action": 18,
+                        "hand_action": 30,
+                        "extrinsic": 16,
+                        "intrinsic": 4,
+                    },
+                },
+            )
+        )
 
         # Cheap structural checks first so bad samples skip JPEG decode + transforms.
         intrinsic_raw = sample["intrinsic"].astype(np.float32)
@@ -295,12 +308,14 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
         hand_state = sample["hand_state"].astype(np.float32)
         wrist_action = sample["wrist_action"].astype(np.float32)
         hand_action = sample["hand_action"].astype(np.float32)
-        self.checker.check(finite={
-            "wrist_state": wrist_state,
-            "hand_state": hand_state,
-            "wrist_action": wrist_action,
-            "hand_action": hand_action,
-        })
+        self.checker.check(
+            finite={
+                "wrist_state": wrist_state,
+                "hand_state": hand_state,
+                "wrist_action": wrist_action,
+                "hand_action": hand_action,
+            }
+        )
         self.checker.check(
             rot6d={"wrist_state": wrist_state, "wrist_action": wrist_action},
             state_action_delta=(wrist_state, hand_state, wrist_action, hand_action),
@@ -375,15 +390,12 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
         if isinstance(instruction, list):
             instruction = instruction[idx]
 
-        state_pad = np.zeros(
-            (self.state_horizon, *state.shape[1:]), dtype=np.float32)
-        state_pad[:state.shape[0]] = state
-        action_pad = np.zeros(
-            (self.action_horizon, *action.shape[1:]), dtype=np.float32)
-        actions_valid_mask = np.zeros(
-            (self.action_horizon, *action.shape[1:]), dtype=bool)
-        action_pad[:action.shape[0]] = action
-        actions_valid_mask[:action.shape[0]] = True
+        state_pad = np.zeros((self.state_horizon, *state.shape[1:]), dtype=np.float32)
+        state_pad[: state.shape[0]] = state
+        action_pad = np.zeros((self.action_horizon, *action.shape[1:]), dtype=np.float32)
+        actions_valid_mask = np.zeros((self.action_horizon, *action.shape[1:]), dtype=bool)
+        action_pad[: action.shape[0]] = action
+        actions_valid_mask[: action.shape[0]] = True
 
         data = self.build_raw_model_inputs(
             instruction=instruction,
@@ -394,14 +406,16 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
             chest_intrinsic=chest_intrinsic,
         )
 
-        data.update({
-            "states": state_pad,
-            "n_states": np.array(state.shape[0], dtype=np.int32),
-            "actions": action_pad,
-            "actions_valid_mask": actions_valid_mask,
-            "n_actions": np.array(action.shape[0], dtype=np.int32),
-            "is_vla_data": np.array(True, dtype=bool),
-        })
+        data.update(
+            {
+                "states": state_pad,
+                "n_states": np.array(state.shape[0], dtype=np.int32),
+                "actions": action_pad,
+                "actions_valid_mask": actions_valid_mask,
+                "n_actions": np.array(action.shape[0], dtype=np.int32),
+                "is_vla_data": np.array(True, dtype=bool),
+            }
+        )
 
         # Future frames for world model supervision (raw uint8, no augmentation).
         # Always emit future_frames when K > 0 so collator can stack; chest
@@ -436,11 +450,14 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
             head_motion = compute_relative_motion_padded(
                 current_flat16=sample["extrinsic"],
                 future_flat=sample.get("future_head_extrinsic"),
-                n_valid=n_valid, K=K,
+                n_valid=n_valid,
+                K=K,
             )
             data["future_head_motion"] = head_motion
 
-            chest_ff, _ = pad_future(sample.get("chest_future_frames"))  # zero-filled when chest RGB is absent
+            chest_ff, _ = pad_future(
+                sample.get("chest_future_frames")
+            )  # zero-filled when chest RGB is absent
             data["chest_future_frames"] = chest_ff
             # Gate on the extrinsics actually read below, not on chest RGB frames:
             # the two come from independent sources (load_chest vs meta["cameras"]).
@@ -448,7 +465,8 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
                 chest_motion = compute_relative_motion_padded(
                     current_flat16=sample.get("chest_extrinsic"),
                     future_flat=sample.get("future_chest_extrinsic"),
-                    n_valid=n_valid, K=K,
+                    n_valid=n_valid,
+                    K=K,
                 )
                 data["future_chest_motion"] = chest_motion
             else:
@@ -474,11 +492,13 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
         """
         datasets_config = []
         for ds in self.wds_datasets:
-            datasets_config.append({
-                "shard_urls": ds["shard_urls"],
-                "weight": ds.get("weight", 1.0),
-                "name": ds.get("name", "unknown"),
-            })
+            datasets_config.append(
+                {
+                    "shard_urls": ds["shard_urls"],
+                    "weight": ds.get("weight", 1.0),
+                    "name": ds.get("name", "unknown"),
+                }
+            )
 
         def preprocess_fn(sample):
             # DataSkipError -> attach_sample_ctx logs and drops the sample;
@@ -490,8 +510,7 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
             sample_to_data_s = time.perf_counter() - sample_to_data_start
             torch_data = dict_apply(
                 data,
-                lambda x: torch.from_numpy(x)
-                if isinstance(x, np.ndarray) else x,
+                lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x,
             )
             preprocess_total_s = time.perf_counter() - preprocess_start
             if self.debug_profile_timing:
@@ -529,8 +548,7 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
         return iter(pipeline)
 
     def get_validation_dataset(self):
-        """Create a validation dataset from separate val shard URLs.
-        """
+        """Create a validation dataset from separate val shard URLs."""
         assert self.val_wds_datasets is not None, "val_wds_datasets is not set"
         val_dataset = VLAWdsDataset(
             wds_datasets=self.val_wds_datasets,
@@ -650,16 +668,27 @@ class VLALowLevelWdsDataset(torch.utils.data.IterableDataset):
 
     def sample_to_data(self, sample):
         """Extract lowdim fields and compute state/action."""
-        self.checker.check(sample_schema=(sample, {
-            "required_keys": ("wrist_state", "hand_state", "wrist_action", "hand_action", "extrinsic"),
-            "expected_last_dim": {
-                "wrist_state": 18,
-                "hand_state": 30,
-                "wrist_action": 18,
-                "hand_action": 30,
-                "extrinsic": 16,
-            },
-        }))
+        self.checker.check(
+            sample_schema=(
+                sample,
+                {
+                    "required_keys": (
+                        "wrist_state",
+                        "hand_state",
+                        "wrist_action",
+                        "hand_action",
+                        "extrinsic",
+                    ),
+                    "expected_last_dim": {
+                        "wrist_state": 18,
+                        "hand_state": 30,
+                        "wrist_action": 18,
+                        "hand_action": 30,
+                        "extrinsic": 16,
+                    },
+                },
+            )
+        )
 
         extrinsic = sample["extrinsic"].astype(np.float32).reshape(4, 4)
         self.checker.check(extrinsic=extrinsic)
@@ -670,12 +699,14 @@ class VLALowLevelWdsDataset(torch.utils.data.IterableDataset):
         hand_state = sample["hand_state"].astype(np.float32)
         wrist_action = sample["wrist_action"].astype(np.float32)
         hand_action = sample["hand_action"].astype(np.float32)
-        self.checker.check(finite={
-            "wrist_state": wrist_state,
-            "hand_state": hand_state,
-            "wrist_action": wrist_action,
-            "hand_action": hand_action,
-        })
+        self.checker.check(
+            finite={
+                "wrist_state": wrist_state,
+                "hand_state": hand_state,
+                "wrist_action": wrist_action,
+                "hand_action": hand_action,
+            }
+        )
         self.checker.check(
             rot6d={"wrist_state": wrist_state, "wrist_action": wrist_action},
             state_action_delta=(wrist_state, hand_state, wrist_action, hand_action),
@@ -722,12 +753,14 @@ class VLALowLevelWdsDataset(torch.utils.data.IterableDataset):
             rng = np.random.default_rng(self.seed + dataset_index)
             order = rng.permutation(len(shard_urls)).tolist()
             shuffled_urls = [shard_urls[idx] for idx in order]
-            shard_groups.append({
-                "dataset_index": dataset_index,
-                "name": dataset_cfg.get("name", f"dataset_{dataset_index}"),
-                "shard_patterns": shard_patterns_metadata,
-                "shard_urls": shuffled_urls,
-            })
+            shard_groups.append(
+                {
+                    "dataset_index": dataset_index,
+                    "name": dataset_cfg.get("name", f"dataset_{dataset_index}"),
+                    "shard_patterns": shard_patterns_metadata,
+                    "shard_urls": shuffled_urls,
+                }
+            )
 
         if not shard_groups:
             raise ValueError("No shards found across all datasets.")
@@ -753,9 +786,7 @@ class VLALowLevelWdsDataset(torch.utils.data.IterableDataset):
             minimum_selected += base_count
 
         if self.max_total_shards is not None and self.max_total_shards < minimum_selected:
-            raise ValueError(
-                "max_total_shards is smaller than the required minimum shard coverage"
-            )
+            raise ValueError("max_total_shards is smaller than the required minimum shard coverage")
 
         if self.max_total_shards is None:
             extra_budget = len(remaining_shards)
@@ -787,17 +818,20 @@ class VLALowLevelWdsDataset(torch.utils.data.IterableDataset):
         for group in shard_groups:
             available_count = len(group["shard_urls"])
             selected_count = selected_counts.get(group["dataset_index"], 0)
-            datasets.append({
-                "name": group["name"],
-                "shard_patterns": group["shard_patterns"],
-                "available_shards": available_count,
-                "selected_shards": selected_count,
-                "full_coverage": selected_count == available_count,
-                "selected_fraction": (
-                    float(selected_count) / float(available_count)
-                    if available_count > 0 else 0.0
-                ),
-            })
+            datasets.append(
+                {
+                    "name": group["name"],
+                    "shard_patterns": group["shard_patterns"],
+                    "available_shards": available_count,
+                    "selected_shards": selected_count,
+                    "full_coverage": selected_count == available_count,
+                    "selected_fraction": (
+                        float(selected_count) / float(available_count)
+                        if available_count > 0
+                        else 0.0
+                    ),
+                }
+            )
 
         available_total = sum(item["available_shards"] for item in datasets)
         selected_total = len(selected_shards)

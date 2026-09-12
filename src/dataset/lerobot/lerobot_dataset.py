@@ -5,6 +5,7 @@ and shared VLA/VLM dataset lifecycle and checkpoint handling.
 """
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -13,12 +14,13 @@ import random
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 
 import av
+import cv2
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -27,36 +29,38 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 
 from src.utils.pytorch_util import dict_apply
-from ..data_transforms import COLOR_AUG
-from ..sanity_checks import DataSkipError, current_worker_id
+from ..data_transforms import COLOR_AUG, resize_frames
+from ..sanity_checks import DataChecker, DataSkipError, current_worker_id
+from ..unified_vla_collator import UnifiedVLACollator
 
 
-
-MOTION_SLICES = {
-    "left_arm_joints": slice(0, 7),
-    "right_arm_joints": slice(7, 14),
-    "left_hand_motors": slice(14, 20),
-    "right_hand_motors": slice(20, 26),
-    "left_wrist_pose": slice(26, 35),
-    "right_wrist_pose": slice(35, 44),
-    "left_fingertips": slice(44, 59),
-    "right_fingertips": slice(59, 74),
-}
 CALIBRATION_SHAPES = {
     **{f"calibration.{cam}_intrinsics": (3, 3) for cam in ("head", "chest")},
     **{f"calibration.{cam}_world2cam": (4, 4) for cam in ("head", "chest")},
-    **{f"calibration.{cam}_cam_to_{side}_base": (4, 4)
-       for cam in ("head", "chest") for side in ("left", "right")},
+    **{
+        f"calibration.{cam}_cam_to_{side}_base": (4, 4)
+        for cam in ("head", "chest")
+        for side in ("left", "right")
+    },
 }
-FRAME_COLUMNS = ("observation.state", "action", "timestamp", "frame_index",
-                 "episode_index", "index", "task_index")
-VIDEO_KEYS = tuple(f"observation.images.{cam}{suffix}"
-                   for cam in ("head", "chest") for suffix in ("", "_depth"))
+VIDEO_KEYS = tuple(
+    f"observation.images.{cam}{suffix}" for cam in ("head", "chest") for suffix in ("", "_depth")
+)
 EPISODE_COLUMNS = {
-    "episode_index", "length", "tasks", "instructions", "dataset_from_index",
-    "dataset_to_index", "data/chunk_index", "data/file_index", *CALIBRATION_SHAPES,
-    *(f"videos/{key}/{field}" for key in VIDEO_KEYS
-      for field in ("chunk_index", "file_index", "from_timestamp", "to_timestamp")),
+    "episode_index",
+    "length",
+    "tasks",
+    "instructions",
+    "dataset_from_index",
+    "dataset_to_index",
+    "data/chunk_index",
+    "data/file_index",
+    *CALIBRATION_SHAPES,
+    *(
+        f"videos/{key}/{field}"
+        for key in VIDEO_KEYS
+        for field in ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
+    ),
 }
 
 
@@ -70,39 +74,36 @@ def camera_parameters(episode, camera):
     )
 
 
-def unpack_motion(values):
-    """Map 74D to wrist18/fingertips30; preserve the precomputed world-frame FK.
-
-    Wrist order is [Lxyz, Rxyz, Lrot6d, Rrot6d], not the source's two 9D blocks.
-    The 26 joint/motor channels are not used by the fingertip model.
-    """
-    values = np.asarray(values, dtype=np.float32)
-    if values.ndim != 2 or values.shape[1] != 74:
-        raise ValueError(f"expected [T,74] motion, got {values.shape}")
-    left = values[:, MOTION_SLICES["left_wrist_pose"]]
-    right = values[:, MOTION_SLICES["right_wrist_pose"]]
+def read_motion(reader, e, indices):
+    """Read measured 74D states and map them to wrist18/fingertips30."""
+    table = reader.read_table(e, indices, ["observation.state", "task_index"])
+    episode = reader.episodes[e]
+    tasks = (reader.tasks.get(int(index)) for index in np.unique(np.asarray(table["task_index"])))
+    if any(task != episode["tasks"][0] for task in tasks):
+        raise ValueError(f"episode {episode['episode_index']}: inconsistent task")
+    frame_ids = np.asarray(table["frame_index"])
+    order = np.argsort(frame_ids)
+    positions = order[np.searchsorted(frame_ids[order], indices)]
+    # Arrow yields NumPy row views; avoid boxing every float through to_pylist().
+    values = np.stack(table["observation.state"].to_numpy())[positions].astype(
+        np.float32, copy=False
+    )
+    left, right = values[:, 26:35], values[:, 35:44]
     wrist = np.concatenate([left[:, :3], right[:, :3], left[:, 3:], right[:, 3:]], axis=-1)
-    hand = np.concatenate([
-        values[:, MOTION_SLICES["left_fingertips"]],
-        values[:, MOTION_SLICES["right_fingertips"]],
-    ], axis=-1)
-    return wrist, hand
+    return wrist, values[:, 44:74].copy()
 
 
 def depth_parameters(feature):
     """Read persisted encoder parameters; never guess them from the codec."""
     info = {**(feature.get("video_info") or {}), **(feature.get("info") or {})}
-    if not (info.get("is_depth_map") or info.get("video.is_depth_map")):
-        raise ValueError("depth feature must declare is_depth_map=true")
-    params = {}
-    for key in ("depth_min", "depth_max", "shift", "use_log"):
-        if f"video.{key}" not in info:
-            raise ValueError(f"depth feature missing persisted video.{key}")
-        params[key] = info[f"video.{key}"]
+    params = {key: info[f"video.{key}"] for key in ("depth_min", "depth_max", "shift", "use_log")}
     lo, hi, shift = (float(params[k]) for k in ("depth_min", "depth_max", "shift"))
-    if (not all(math.isfinite(v) for v in (lo, hi, shift)) or not 0 <= lo < hi
-            or not isinstance(params["use_log"], bool)
-            or (params["use_log"] and lo + shift <= 0)):
+    if (
+        not all(math.isfinite(v) for v in (lo, hi, shift))
+        or not 0 <= lo < hi
+        or not isinstance(params["use_log"], bool)
+        or (params["use_log"] and lo + shift <= 0)
+    ):
         raise ValueError(f"invalid depth quantization parameters: {params}")
     return params
 
@@ -115,8 +116,6 @@ def dequantize_depth_m(codes, *, depth_min, depth_max, shift, use_log):
     Valid codes follow the same affine/logarithmic inverse as depth_utils.py.
     """
     codes = np.asarray(codes)
-    if codes.ndim != 2 or codes.dtype != np.uint16 or np.any(codes > 4095):
-        raise ValueError("expected uint16 HW depth codes in [0,4095]")
     lo, hi, shift = float(depth_min), float(depth_max), float(shift)
     if use_log:
         offset = math.log(lo + shift)
@@ -132,109 +131,108 @@ def dequantize_depth_m(codes, *, depth_min, depth_max, shift, use_log):
     return result
 
 
-class VideoFrameCache:
-    """Bounded frame LRU with a persistent sequential decoder per video file."""
+@dataclass
+class WindowConfig:
+    """Sampling window parameters for sliding window compose."""
 
-    def __init__(self, max_frames=256, max_readers=4):
-        if max_frames < 1 or max_readers < 1:
-            raise ValueError("video cache sizes must be positive")
-        self.max_frames = int(max_frames)
-        self.max_readers = int(max_readers)
-        self.frames = OrderedDict()
-        self.readers = OrderedDict()
+    action_horizon: int = 32
+    action_stride: int = 1
+    state_horizon: int = 16
+    state_stride: int = 2
+    image_horizon: int = 1
+    image_stride: int = 30
+    history_pad_mode: str = "repeat"
+    action_pad_mode: str = "truncate"
+    future_frame_horizon: int = 0
+    future_frame_stride: int = 30
+    future_frame_pad_mode: str = "repeat"
 
-    def close(self):
-        for state in self.readers.values():
-            state["container"].close()
-        self.readers.clear()
-        self.frames.clear()
+    def __post_init__(self):
+        valid_modes = {"repeat", "truncate"}
+        for name in ("history_pad_mode", "action_pad_mode", "future_frame_pad_mode"):
+            value = getattr(self, name)
+            if value not in valid_modes:
+                raise ValueError(f"Invalid {name}: {value}")
 
-    def _get_reader(self, path, fps):
-        if path not in self.readers:
-            container = av.open(path)
-            stream = container.streams.video[0]
-            stream.thread_count = 1
-            if stream.average_rate is None or not np.isclose(float(stream.average_rate), fps):
-                container.close()
-                raise ValueError(f"{path}: video fps does not match info.json fps={fps}")
-            self.readers[path] = {
-                "container": container,
-                "stream": stream,
-                "decoder": None,
-                "last": -1,
-            }
-            while len(self.readers) > self.max_readers:
-                self.readers.popitem(last=False)[1]["container"].close()
-        self.readers.move_to_end(path)
-        return self.readers[path]
 
-    def _decode_interval(self, path, first, last, fps, depth):
-        """Seek when needed, then decode forward while retaining decoder position."""
-        state = self._get_reader(path, fps)
-        stream = state["stream"]
-        needs_seek = state["decoder"] is None or first <= state["last"] or first - state["last"] > fps
-        if needs_seek:
-            pts = int((first / fps) / float(stream.time_base))
-            state["container"].seek(pts, stream=stream, backward=True, any_frame=False)
-            state["decoder"] = state["container"].decode(stream)
-            state["last"] = -1
+def decode_sample_media(sample):
+    """Decode VLA frame windows or VLM image fields after shuffle."""
+    if "image_frame_refs" not in sample:
+        from PIL import Image
 
-        for frame in state["decoder"]:
-            if frame.pts is None:
-                raise ValueError(f"{path}: missing video PTS")
-            position = float(frame.pts * stream.time_base) * fps
-            index = round(position)
-            if not np.isclose(position, index, atol=1e-3):
-                raise ValueError(f"{path}: frame PTS is not aligned to the declared fps")
-            state["last"] = index
-            if index < first:
+        for key, value in list(sample.items()):
+            if key.startswith("image_") and key.endswith(".jpg"):
+                sample[key] = Image.open(io.BytesIO(value)).convert("RGB")
+        return sample
+
+    for refs_key, fields in (
+        (
+            "image_frame_refs",
+            (
+                ("image", "image.jpg"),
+                ("depth", "depth.npy"),
+                ("chest_image", "chest_image.jpg"),
+                ("chest_depth", "chest_depth.npy"),
+            ),
+        ),
+        (
+            "future_frame_refs",
+            (("future_frames", "image.jpg"), ("chest_future_frames", "chest_image.jpg")),
+        ),
+    ):
+        refs = sample.pop(refs_key, None)
+        if refs is None:
+            continue
+        for output_key, media_key in fields:
+            if refs[-1].get(media_key) is None:
                 continue
-            if index > last:
-                break
-            if depth:
-                if frame.format.name != "gray12le":
-                    raise ValueError(f"{path}: expected gray12le depth, got {frame.format.name}")
-                array = dequantize_depth_m(frame.to_ndarray(format="gray12le"), **depth)
-            else:
-                array = frame.to_ndarray(format="rgb24")
-            yield index, array
-            if index == last:
-                break
+            frames = []
+            for ref in refs:
+                value = ref[media_key]
+                if media_key.endswith(".npy"):
+                    frame = np.load(io.BytesIO(value))
+                else:
+                    frame = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if frame is None:
+                        raise ValueError("JPEG decoding failed")
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2RGB, dst=frame)
+                frames.append(frame)
+            sample[output_key] = np.stack(frames)
+    return sample
 
-    def read(self, path, indices, fps, depth=None):
-        path = str(path)
-        indices = [int(i) for i in indices]
-        if not indices or min(indices) < 0:
-            raise ValueError("video indices must be nonempty and nonnegative")
-        kind = tuple(sorted(depth.items())) if depth else None
-        need = sorted(set(indices))
-        key = lambda i: (path, kind, i)
-        resolved = {i: self.frames[key(i)] for i in need if key(i) in self.frames}
-        for i in resolved:
-            self.frames.move_to_end(key(i))
-        missing = [i for i in need if i not in resolved]
-        if missing:
-            requested = set(missing)
-            for i, array in self._decode_interval(path, missing[0], missing[-1], fps, depth):
-                self.frames[key(i)] = array
-                if i in requested:
-                    resolved[i] = array
-                while len(self.frames) > self.max_frames:
-                    self.frames.popitem(last=False)
-            if set(need) - resolved.keys():
-                raise ValueError(f"{path}: missing video frames {sorted(set(need) - resolved.keys())}")
-        return np.stack([resolved[i] for i in indices])
+
+JPEG_QUALITY = 80
+
+
+def encode_frame(array, target_size=None):
+    """Resize and encode RGB as JPEG80 or depth as lossless NPY bytes."""
+    if target_size is not None and tuple(array.shape[:2]) != tuple(target_size):
+        interpolation = cv2.INTER_NEAREST if array.ndim == 2 else cv2.INTER_LINEAR
+        array = resize_frames(array[None], target_size, interpolation=interpolation)[0]
+    if array.ndim == 2:
+        output = io.BytesIO()
+        np.save(output, array, allow_pickle=False)
+        return output.getvalue()
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        cv2.cvtColor(array, cv2.COLOR_RGB2BGR),
+        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
+    )
+    if not ok:
+        raise ValueError("JPEG encoding failed")
+    return encoded.tobytes()
 
 
 class LeRobotEpisodeReader:
     """Read one episode split with projected Parquet columns and worker-local caches."""
 
-    frame_columns = FRAME_COLUMNS
+    is_vla = True
     episode_columns = EPISODE_COLUMNS
     video_keys = VIDEO_KEYS
 
-    def __init__(self, root, split, row_group_cache_size=8, frame_cache_size=256,
-                 video_reader_cache_size=4):
+    def __init__(
+        self, root, split, row_group_cache_size=8, frame_cache_size=256, video_reader_cache_size=4
+    ):
         self.root = Path(root)
         self.split = split
         self.row_group_cache_size = int(row_group_cache_size)
@@ -246,229 +244,281 @@ class LeRobotEpisodeReader:
         self._validate_features()
         self.depth_params = {
             key: depth_parameters(self.info["features"][key])
-            for key in self.video_keys if key.endswith("_depth")
+            for key in self.video_keys
+            if key.endswith("_depth")
         }
         self.data_template = self.info["data_path"]
         self.video_template = self.info["video_path"] if self.video_keys else None
-        self.tasks = self._read_tasks()
+        self.tasks = {}
+        if self.is_vla:
+            rows = pq.read_table(
+                self.root / "meta/tasks.parquet", columns=["task_index", "task"]
+            ).to_pylist()
+            self.tasks = {int(row["task_index"]): row["task"] for row in rows}
         self.episodes = self._read_episodes()
-        self.blocks = self._index_row_groups()
+        self.data_paths = [
+            str(
+                self.root
+                / self.data_template.format(
+                    chunk_index=row["data/chunk_index"], file_index=row["data/file_index"]
+                )
+            )
+            for row in self.episodes
+        ]
+        self.blocks, self.columns = {}, {}
+        files = {}
+        for e, path in enumerate(self.data_paths):
+            files.setdefault(path, []).append(e)
+        for path, positions in files.items():
+            with pq.ParquetFile(path) as file:
+                self.columns[path] = set(file.schema_arrow.names)
+                column = file.schema.names.index("episode_index")
+                stats = [
+                    file.metadata.row_group(g).column(column).statistics
+                    for g in range(file.num_row_groups)
+                ]
+                episode_ids = np.array([self.episodes[e]["episode_index"] for e in positions])
+                self.blocks.update((e, []) for e in positions)
+                for group, stat in enumerate(stats):
+                    lo, hi = (
+                        (0, len(positions))
+                        if stat is None or not stat.has_min_max
+                        else (
+                            np.searchsorted(episode_ids, stat.min, side="left"),
+                            np.searchsorted(episode_ids, stat.max, side="right"),
+                        )
+                    )
+                    for e in positions[lo:hi]:
+                        self.blocks[e].append(group)
         self.reset_caches()
 
     def _validate_features(self):
-        if self.info.get("codebase_version") != "v3.0":
-            raise ValueError("expected codebase_version v3.0")
         self.fps = float(self.info["fps"])
         if not np.isfinite(self.fps) or self.fps <= 0:
             raise ValueError("info.json fps must be positive")
-        features = self.info["features"]
-        for key in ("observation.state", "action"):
-            if features[key]["shape"] != [74] or features[key]["dtype"] != "float32":
-                raise ValueError(f"{key} must declare float32 [74], per release specification §4")
-        for key in VIDEO_KEYS:
-            channels = 1 if key.endswith("_depth") else 3
-            shape = features[key]["shape"]
-            if (features[key]["dtype"] != "video" or len(shape) != 3
-                    or shape[-1] != channels or min(shape) < 1):
-                raise ValueError(f"{key} must declare HWC video with {channels} channels")
-
-    def _read_tasks(self):
-        rows = pq.read_table(
-            self.root / "meta/tasks.parquet", columns=["task_index", "task"],
-        ).to_pylist()
-        tasks = {int(row["task_index"]): row["task"] for row in rows}
-        if len(tasks) != len(rows) or not all(isinstance(name, str) and name for name in tasks.values()):
-            raise ValueError("invalid task vocabulary")
-        return tasks
+        # Layout is fixed; sample values are checked by DataChecker after shuffle.
+        if self.info["features"]["observation.state"]["shape"] != [74]:
+            raise ValueError("observation.state must declare the released 74D layout")
 
     def _read_episodes(self):
         """Project metadata before filtering the split; omit the large stats columns."""
-        try:
-            start, stop = map(int, self.info["splits"][self.split].split(":"))
-        except (KeyError, ValueError, AttributeError) as exc:
-            raise ValueError(
-                f"info.json must declare split {self.split!r} as an episode interval start:stop"
-            ) from exc
+        start, stop = map(int, self.info["splits"][self.split].split(":"))
         if not 0 <= start <= stop <= int(self.info["total_episodes"]):
             raise ValueError(f"invalid episode split {self.split}: {start}:{stop}")
         metadata_paths = sorted((self.root / "meta/episodes").rglob("*.parquet"))
-        if not metadata_paths:
-            raise ValueError("missing meta/episodes parquet files")
         episodes = []
         for path in metadata_paths:
             names = set(pq.read_schema(path).names)
-            missing = self.episode_columns - names
-            if missing:
-                raise ValueError(f"{path}: missing release metadata {sorted(missing)}")
             columns = sorted(self.episode_columns | ({"split"} & names))
             table = pq.read_table(path, columns=columns)
             ids = np.asarray(table["episode_index"])
             table = table.take(pa.array(np.flatnonzero((ids >= start) & (ids < stop))))
             for row in table.to_pylist():
-                self._validate_episode(row)
+                eid = row["episode_index"]
+                if (
+                    int(row["length"]) <= 0
+                    or row["dataset_to_index"] - row["dataset_from_index"] != row["length"]
+                ):
+                    raise ValueError(f"episode {eid}: invalid length/global index interval")
+                if self.is_vla:
+                    for field, shape in CALIBRATION_SHAPES.items():
+                        row[field] = np.asarray(row[field], dtype=np.float64).reshape(shape)
+                    if not np.allclose(row["calibration.head_world2cam"], np.eye(4), atol=1e-6):
+                        raise ValueError(f"episode {eid}: head_world2cam must be identity")
+                for key in self.video_keys:
+                    prefix = f"videos/{key}"
+                    if not self.is_vla and row.get(f"{prefix}/file_index") is None:
+                        continue
+                    first, last = (
+                        float(row[f"{prefix}/{side}_timestamp"]) for side in ("from", "to")
+                    )
+                    if (
+                        not (np.isfinite(first) and np.isfinite(last) and 0 <= first < last)
+                        or not np.isclose(first * self.fps, round(first * self.fps), atol=1e-3)
+                        or not np.isclose((last - first) * self.fps, row["length"], atol=1e-3)
+                    ):
+                        raise ValueError(
+                            f"episode {eid}: {key} interval does not align with episode frames"
+                        )
                 episodes.append(row)
         episodes.sort(key=lambda row: int(row["episode_index"]))
         if [int(row["episode_index"]) for row in episodes] != list(range(start, stop)):
             raise ValueError(f"metadata has missing/duplicate episodes for split {self.split}")
         return episodes
 
-    def _validate_episode(self, row):
-        self._validate_episode_bounds(row)
-        eid = row["episode_index"]
-        if not isinstance(row["tasks"], list) or len(row["tasks"]) != 1 or row["tasks"][0] not in self.tasks.values():
-            raise ValueError(f"episode {eid}: tasks must contain one vocabulary task name")
-        if (not isinstance(row["instructions"], list) or not row["instructions"]
-                or not all(isinstance(s, str) and s.strip() for s in row["instructions"])):
-            raise ValueError(f"episode {eid}: instructions must be nonempty strings")
-        # Keep all native instructions, including merged annotations.
-        for field, shape in CALIBRATION_SHAPES.items():
-            array = np.asarray(row[field], dtype=np.float64)
-            if array.shape != (int(np.prod(shape)),) or not np.isfinite(array).all():
-                raise ValueError(f"episode {eid}: {field} must be finite flattened {shape}")
-            row[field] = array.reshape(shape)
-        if not np.allclose(row["calibration.head_world2cam"], np.eye(4), atol=1e-6):
-            raise ValueError(f"episode {eid}: head_world2cam must be identity")
-        self._validate_video_intervals(row, self.video_keys)
-
-    def _validate_episode_bounds(self, row):
-        eid = row["episode_index"]
-        if int(row["length"]) <= 0 or row["dataset_to_index"] - row["dataset_from_index"] != row["length"]:
-            raise ValueError(f"episode {eid}: invalid length/global index interval")
-        if "split" in row and row["split"] != self.split:
-            raise ValueError(f"episode {eid}: split column disagrees with info.json")
-
-    def _validate_video_intervals(self, row, keys):
-        eid = row["episode_index"]
-        for key in keys:
-            prefix = f"videos/{key}"
-            first, last = (float(row[f"{prefix}/{s}_timestamp"]) for s in ("from", "to"))
-            if not (np.isfinite(first) and np.isfinite(last) and 0 <= first < last):
-                raise ValueError(f"episode {eid}: invalid {key} time interval")
-            if not np.isclose(first * self.fps, round(first * self.fps), atol=1e-3):
-                raise ValueError(f"episode {eid}: {key} offset not aligned to fps")
-            if not np.isclose((last - first) * self.fps, row["length"], atol=1e-3):
-                raise ValueError(f"episode {eid}: {key} interval does not match episode length")
-
-    def data_path(self, row):
-        return self.root / self.data_template.format(
-            chunk_index=row["data/chunk_index"], file_index=row["data/file_index"])
-
-    def _index_row_groups(self):
-        """Use footer statistics only; no 74D columns materialized at startup."""
-        result = {}
-        files = {}
-        for e, episode in enumerate(self.episodes):
-            files.setdefault(str(self.data_path(episode)), []).append(e)
-        for path, positions in files.items():
-            with pq.ParquetFile(path) as file:
-                missing = set(self.frame_columns) - set(file.schema_arrow.names)
-                if missing:
-                    raise ValueError(f"{path}: missing frame columns {sorted(missing)}")
-                column = file.schema.names.index("episode_index")
-                for e in positions:
-                    eid = self.episodes[e]["episode_index"]
-                    result[e] = []
-                    for group in range(file.num_row_groups):
-                        stats = file.metadata.row_group(group).column(column).statistics
-                        if stats is None or not stats.has_min_max or stats.min <= eid <= stats.max:
-                            result[e].append(group)
-                    if not result[e]:
-                        raise ValueError(f"{path}: episode {eid} has no candidate row groups")
-        return result
-
     def reset_caches(self):
         for file in getattr(self, "files", {}).values():
             file.close()
-        if hasattr(self, "video"):
-            self.video.close()
+        for reader in getattr(self, "video_readers", {}).values():
+            reader["container"].close()
         self.files = OrderedDict()
         self.row_groups = OrderedDict()
-        self.video = VideoFrameCache(self.frame_cache_size, self.video_reader_cache_size)
+        self.video_readers = OrderedDict()
 
     def __getstate__(self):
-        return {key: value for key, value in self.__dict__.items() if key not in ("files", "row_groups", "video")}
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key not in ("files", "row_groups", "video_readers")
+        }
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.reset_caches()
 
-    def _get_file(self, path):
+    def read_table(self, e, indices, columns):
+        """Project requested frame fields, preserving episode/frame identity."""
+        episode = self.episodes[e]
+        indices = np.asarray(indices, dtype=np.int64)
+        path = self.data_paths[e]
         if path not in self.files:
             self.files[path] = pq.ParquetFile(path)
             while len(self.files) > self.row_group_cache_size:
                 self.files.popitem(last=False)[1].close()
         self.files.move_to_end(path)
-        return self.files[path]
-
-    def _read_row_group(self, file, path, group, columns):
-        key = (path, group, tuple(columns))
-        if key not in self.row_groups:
-            self.row_groups[key] = file.read_row_group(group, columns=columns)
-            while len(self.row_groups) > self.row_group_cache_size:
-                self.row_groups.popitem(last=False)
-        self.row_groups.move_to_end(key)
-        return self.row_groups[key]
-
-    def read_lowdim(self, e, indices, column):
-        """Return requested 74D rows in requested order, selecting in Arrow first."""
-        if column not in ("observation.state", "action"):
-            raise ValueError(f"not a motion column: {column}")
-        rows = self.read_rows(e, indices, [column, "task_index"])
-        episode = self.episodes[e]
-        for k, row in rows.items():
-            if self.tasks.get(int(row["task_index"])) != episode["tasks"][0]:
-                raise ValueError(f"episode {episode['episode_index']} frame {k}: inconsistent task")
-        array = np.asarray([rows[int(k)][column] for k in indices], dtype=np.float32)
-        if array.shape != (len(indices), 74) or not np.isfinite(array).all():
-            raise ValueError(f"{column}: expected finite [T,74] values")
-        return array
-
-    def read_rows(self, e, indices, columns):
-        """Project requested frame fields, preserving episode/frame identity."""
-        episode = self.episodes[e]
-        indices = np.asarray(indices, dtype=np.int64)
-        if indices.ndim != 1 or not len(indices) or indices.min() < 0 or indices.max() >= episode["length"]:
-            raise IndexError("frame indices outside episode")
-        path = str(self.data_path(episode))
-        file = self._get_file(path)
+        file = self.files[path]
         columns = sorted(set(columns) | {"episode_index", "frame_index", "index", "timestamp"})
         frame_column = file.schema.names.index("frame_index")
         tables = []
+        requested = np.unique(indices)
         for group in self.blocks[e]:
             stats = file.metadata.row_group(group).column(frame_column).statistics
-            if stats is not None and stats.has_min_max and not np.any((indices >= stats.min) & (indices <= stats.max)):
+            if (
+                stats is not None
+                and stats.has_min_max
+                and not np.any((indices >= stats.min) & (indices <= stats.max))
+            ):
                 continue
-            table = self._read_row_group(file, path, group, columns)
-            select = (np.asarray(table["episode_index"]) == episode["episode_index"])
-            select &= np.isin(np.asarray(table["frame_index"]), indices)
-            if select.any():
-                tables.append(table.take(pa.array(np.flatnonzero(select))))
-        selected = [] if not tables else pa.concat_tables(tables).to_pylist()
-        rows = {int(row["frame_index"]): row for row in selected}
-        if len(rows) != len(selected) or set(indices) != set(rows):
+            cache_key = (path, group, tuple(columns))
+            if cache_key not in self.row_groups:
+                table = file.read_row_group(group, columns=columns)
+                episode_ids = np.asarray(table["episode_index"])
+                frame_ids = np.asarray(table["frame_index"])
+                order = np.lexsort((frame_ids, episode_ids))
+                ids = np.empty(
+                    len(order), dtype=[("episode", episode_ids.dtype), ("frame", frame_ids.dtype)]
+                )
+                ids["episode"], ids["frame"] = episode_ids[order], frame_ids[order]
+                self.row_groups[cache_key] = (table, ids, order)
+                while len(self.row_groups) > self.row_group_cache_size:
+                    self.row_groups.popitem(last=False)
+            self.row_groups.move_to_end(cache_key)
+            table, ids, order = self.row_groups[cache_key]
+            # Match by episode/frame, then validate global index; malformed duplicates must stay visible.
+            query = np.empty(len(requested), dtype=ids.dtype)
+            query["episode"], query["frame"] = episode["episode_index"], requested
+            left = np.searchsorted(ids, query, side="left")
+            right = np.searchsorted(ids, query, side="right")
+            positions = [order[lo:hi] for lo, hi in zip(left, right) if lo < hi]
+            if positions:
+                tables.append(table.take(pa.array(np.concatenate(positions))))
+        if not tables:
+            raise ValueError(f"episode {episode['episode_index']}: missing frame indices")
+        selected = pa.concat_tables(tables)
+        frame_ids = np.asarray(selected["frame_index"])
+        unique_ids = np.unique(frame_ids)
+        if len(unique_ids) != len(frame_ids) or not np.array_equal(unique_ids, np.unique(indices)):
             raise ValueError(f"episode {episode['episode_index']}: missing/duplicate frame indices")
-        for k, row in rows.items():
-            if (row["index"] != episode["dataset_from_index"] + k
-                    or not np.isclose(row["timestamp"], k / self.fps, atol=1e-5)):
-                raise ValueError(f"episode {episode['episode_index']} frame {k}: inconsistent index/time")
-        return rows
+        valid = np.asarray(selected["episode_index"]) == episode["episode_index"]
+        valid &= np.asarray(selected["index"]) == episode["dataset_from_index"] + frame_ids
+        valid &= np.isclose(np.asarray(selected["timestamp"]), frame_ids / self.fps, atol=1e-5)
+        if not valid.all():
+            k = frame_ids[np.flatnonzero(~valid)[0]]
+            raise ValueError(
+                f"episode {episode['episode_index']} frame {k}: inconsistent index/time"
+            )
+        return selected
 
-    def read_media(self, e, key, indices):
-        if key not in self.video_keys:
-            raise ValueError(f"unsupported release video feature {key}")
+    def read_media(self, e, key, indices, compressed=False, target_size=None):
         episode = self.episodes[e]
-        if not len(indices) or min(indices) < 0 or max(indices) >= episode["length"]:
-            raise IndexError("media frame indices outside episode")
         prefix = f"videos/{key}"
         path = self.root / self.video_template.format(
-            video_key=key, chunk_index=episode[f"{prefix}/chunk_index"], file_index=episode[f"{prefix}/file_index"])
+            video_key=key,
+            chunk_index=episode[f"{prefix}/chunk_index"],
+            file_index=episode[f"{prefix}/file_index"],
+        )
         first = round(float(episode[f"{prefix}/from_timestamp"]) * self.fps)
         # RGB/depth do NOT share file indices or offsets in the release.
-        frames = self.video.read(path, [first + int(k) for k in indices], self.fps, self.depth_params.get(key))
-        expected = self.info["features"][key]["shape"]
-        if tuple(frames.shape[1:3]) != tuple(expected[:2]):
+        indices = [first + int(k) for k in indices]
+        path = str(path)
+        depth = self.depth_params.get(key)
+        kind = tuple(sorted(depth.items())) if depth else None
+        size = tuple(target_size) if compressed and target_size is not None else None
+        cache_key = (path, kind, size)
+        if cache_key not in self.video_readers:
+            container = av.open(path)
+            stream = container.streams.video[0]
+            stream.thread_count = 1
+            if stream.average_rate is None or not np.isclose(float(stream.average_rate), self.fps):
+                container.close()
+                raise ValueError(f"{path}: video fps does not match info.json")
+            self.video_readers[cache_key] = dict(
+                container=container, stream=stream, decoder=None, last=-1, frames=OrderedDict()
+            )
+            while len(self.video_readers) > self.video_reader_cache_size:
+                self.video_readers.popitem(last=False)[1]["container"].close()
+        self.video_readers.move_to_end(cache_key)
+        reader = self.video_readers[cache_key]
+        cache = reader["frames"]
+        needed = sorted(set(indices))
+        resolved = {i: cache[i] for i in needed if i in cache}
+        for i in resolved:
+            cache.move_to_end(i)
+        missing = [i for i in needed if i not in resolved]
+        if missing:
+            stream = reader["stream"]
+            first, last = missing[0], missing[-1]
+            if (
+                reader["decoder"] is None
+                or first <= reader["last"]
+                or first - reader["last"] > self.fps
+            ):
+                pts = int((first / self.fps) / float(stream.time_base))
+                reader["container"].seek(pts, stream=stream, backward=True, any_frame=False)
+                reader["decoder"] = reader["container"].decode(stream)
+                reader["last"] = -1
+            else:
+                # Retain intermediate frames too: later history windows will request them.
+                first = reader["last"] + 1
+            requested = set(missing)
+            for frame in reader["decoder"]:
+                position = float(frame.pts * stream.time_base) * self.fps
+                i = round(position)
+                if not np.isclose(position, i, atol=1e-3):
+                    raise ValueError(f"{path}: frame PTS is not aligned to fps")
+                reader["last"] = i
+                if i < first:
+                    continue
+                if i > last:
+                    break
+                if depth:
+                    if frame.format.name != "gray12le":
+                        raise ValueError(
+                            f"{path}: expected gray12le depth, got {frame.format.name}"
+                        )
+                    array = dequantize_depth_m(frame.to_ndarray(format="gray12le"), **depth)
+                else:
+                    array = frame.to_ndarray(format="rgb24")
+                source_shape = array.shape[:2]
+                if size is not None:
+                    interpolation = cv2.INTER_NEAREST if depth else cv2.INTER_LINEAR
+                    array = resize_frames(array[None], size, interpolation=interpolation)[0]
+                cache[i] = (array, source_shape)
+                cache.move_to_end(i)
+                if i in requested:
+                    resolved[i] = cache[i]
+                while len(cache) > self.frame_cache_size:
+                    cache.popitem(last=False)
+                if i == last:
+                    break
+        expected_shape = tuple(self.info["features"][key]["shape"][:2])
+        if any(tuple(resolved[i][1]) != expected_shape for i in needed):
             raise ValueError(f"{key}: decoded resolution disagrees with info.json")
-        return frames
+        if compressed:
+            # JPEG/NPY bytes are local to this window, never shared across samples.
+            encoded = {i: encode_frame(resolved[i][0]) for i in needed}
+            return [encoded[i] for i in indices]
+        return np.stack([resolved[i][0] for i in indices])
 
 
 class StreamSample(dict):
@@ -502,123 +552,153 @@ def sample_random_seed(seed):
             COLOR_AUG.seed = aug_seed
 
 
-class EpisodeSource:
-    """Cursor of the next candidate, including dropped and invalid anchors."""
-
-    def __init__(self, dataset, assigned, global_worker, saved=None):
-        self.dataset = dataset
-        self.assigned = assigned
-        self.worker = global_worker
-        self.round_idx = self.episode_pos = self.frame = 0
-        self.attempted = self.usable = 0
-        if saved is not None:
-            for name in ("round_idx", "episode_pos", "frame", "attempted", "usable"):
-                setattr(self, name, int(saved[name]))
-        self._start_round()
-        if saved is not None:
-            self.drop_rng.bit_generator.state = deepcopy(saved["drop_rng"])
-
-    def _start_round(self):
-        seed = self.dataset.seed
-        self.order = np.random.default_rng([seed, self.round_idx, self.worker, 2]).permutation(self.assigned)
-        self.drop_rng = np.random.default_rng([seed, self.round_idx, self.worker, 0])
-
-    def next_descriptor(self):
-        while True:
-            if self.episode_pos == len(self.order):
-                if self.attempted and not self.usable:
-                    raise ValueError("all attempted samples in this worker round failed sanity checks")
-                self.round_idx += 1
-                self.episode_pos = self.frame = self.attempted = self.usable = 0
-                self._start_round()
-            e = int(self.order[self.episode_pos])
-            length = self.dataset.num_anchors(e)
-            if self.frame == length:
-                self.episode_pos += 1
-                self.frame = 0
-                continue
-            k = self.frame
-            self.frame += 1
-            if self.drop_rng.random() < self.dataset.drop_ratio:
-                continue
-            self.attempted += 1
-            seed = int(np.random.SeedSequence(
-                [self.dataset.seed, self.round_idx, self.worker, e, k, 3]).generate_state(1)[0])
-            return e, k, seed
-
-    def state_dict(self):
-        return {
-            "round_idx": self.round_idx,
-            "episode_pos": self.episode_pos,
-            "frame": self.frame,
-            "attempted": self.attempted,
-            "usable": self.usable,
-            "drop_rng": self.drop_rng.bit_generator.state,
-        }
-
-
-class ResumableEpisodeStream:
-    """Shuffle complete samples while checkpointing lightweight descriptors.
-
-    Restored residents decode lazily. New samples decode in source order before
-    entering the queue. Queue and buffer positions always refer to the same sample.
-    """
-
-    def __init__(self, dataset, assigned, global_worker, logical_worker, saved=None):
-        self.dataset = dataset
-        self.source = EpisodeSource(dataset, assigned, global_worker, saved["source"] if saved else None)
-        self.shuffle_rng = np.random.default_rng([dataset.seed, global_worker, 1])
-        self.queue = list(saved["queue"]) if saved else []
-        self.buffer = [None] * len(self.queue)
-        self.delivered = int(saved["delivered"]) if saved else 0
-        if saved:
-            self.shuffle_rng.bit_generator.state = deepcopy(saved["shuffle_rng"])
-        self.live_state = {"worker_id": logical_worker, "queue": self.queue}
-
-    def materialize(self, descriptor):
-        e, k, seed = descriptor
-        with sample_random_seed(seed):
-            return self.dataset.materialize_with_context(e, k)
-
-    def append_source(self):
-        while True:
-            descriptor = self.source.next_descriptor()
-            sample = self.materialize(descriptor)
-            if sample is None:
-                continue
-            self.source.usable += 1
-            self.queue.append(descriptor)
-            self.buffer.append(sample)
+def build_lerobot_pipeline(dataset, global_worker, total_workers, logical_worker=None):
+    """Read/encode -> shuffle -> decode/preprocess, with resumable source and queue."""
+    episodes = [e for e in range(len(dataset.reader.episodes)) if dataset.num_anchors(e) > 0]
+    assigned = np.asarray(episodes[global_worker::total_workers], dtype=np.int64)
+    if not len(assigned):
+        if dataset.mode == "val":
             return
+        raise ValueError("each training worker needs an episode; reduce workers or add data")
 
-    def __iter__(self):
-        while True:
-            self.append_source()
-            if len(self.buffer) < self.dataset.shuffle_buffer:
-                self.append_source()
-            if len(self.buffer) < self.dataset.shuffle_initial:
-                continue
-            pick = int(self.shuffle_rng.integers(len(self.buffer)))
-            output = self.buffer[pick]
-            if output is None:
-                output = self.materialize(self.queue[pick])
-                if output is None:
-                    raise RuntimeError("checkpoint resident no longer passes validation; dataset/transforms changed")
-            for buffer in (self.buffer, self.queue):
-                buffer[pick] = buffer[-1]
-                buffer.pop()
-            self.delivered += 1
-            if self.dataset.resume_enabled:
-                self.live_state.update(
-                    source=self.source.state_dict(),
-                    shuffle_rng=self.shuffle_rng.bit_generator.state,
-                    delivered=self.delivered,
+    def read_window(descriptor):
+        e, k, _ = descriptor
+        try:
+            return dataset.read_window(e, k, load_media=not dataset.lowdim_only, compressed=True)
+        except DataSkipError as exc:
+            dataset.checker.note_sample_seen()
+            sample = {
+                "dataset_name": dataset.root,
+                "episode_index": dataset.reader.episodes[e]["episode_index"],
+                "__key__": f"frame_{k}",
+            }
+            dataset.checker.log_skip(current_worker_id(), exc, sample)
+        except Exception as exc:
+            episode_id = dataset.reader.episodes[e]["episode_index"]
+            raise RuntimeError(
+                f"LeRobot read error: root={dataset.root}, episode={episode_id}, frame={k}"
+            ) from exc
+
+    def preprocess(descriptor, sample):
+        e, k, seed = descriptor
+        dataset.checker.note_sample_seen()
+        sample = dict(sample)
+        try:
+            with sample_random_seed(seed) if seed is not None else nullcontext():
+                if not dataset.lowdim_only:
+                    sample = decode_sample_media(sample)
+                start = time.perf_counter()
+                data = dataset.sample_to_data(sample)
+                transform_s = time.perf_counter() - start
+                data = dict_apply(
+                    data, lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x
                 )
-                output = StreamSample(output)
-                # The collator freezes this shared state after the last sample.
-                output.stream_state = self.live_state
-                output.stream_name = self.dataset.stream_name
-            yield output
+                if getattr(dataset, "debug_profile_timing", False) and not dataset.lowdim_only:
+                    data["debug_sample_profile"] = {
+                        "worker_id": current_worker_id(),
+                        "sample_to_data_s": transform_s,
+                        "preprocess_total_s": time.perf_counter() - start,
+                    }
+                return data
+        except DataSkipError as exc:
+            dataset.checker.log_skip(current_worker_id(), exc, sample)
+        except Exception as exc:
+            episode_id = dataset.reader.episodes[e]["episode_index"]
+            raise RuntimeError(
+                f"LeRobot sample error: root={dataset.root}, episode={episode_id}, frame={k}"
+            ) from exc
+
+    if dataset.mode == "val":
+        seen = 0
+        for e in assigned:
+            for k in range(dataset.num_anchors(e)):
+                keep = seen % dataset.val_stride == 0
+                seen += 1
+                if not keep:
+                    continue
+                descriptor = (int(e), k, None)
+                sample = read_window(descriptor)
+                data = preprocess(descriptor, sample) if sample is not None else None
+                if data is not None:
+                    yield data
+        return
+
+    logical_worker = global_worker if logical_worker is None else logical_worker
+    saved = dataset.worker_resume_states.get(logical_worker) if dataset.resume_enabled else None
+    cursor = dict(round_idx=0, episode_pos=0, frame=0, attempted=0, usable=0)
+    if saved:
+        cursor.update({key: int(saved["source"][key]) for key in cursor})
+    queue = list(saved["queue"]) if saved else []
+    buffer = [None] * len(queue)
+    rng = np.random.default_rng([dataset.seed, global_worker, 1])
+    if saved:
+        rng.bit_generator.state = deepcopy(saved["shuffle_rng"])
+    state = {"worker_id": logical_worker, "queue": queue}
+    delivered = int(saved["delivered"]) if saved else 0
+    for i in sorted(range(len(queue)), key=lambda i: queue[i][:2]):
+        buffer[i] = read_window(queue[i])
+        if buffer[i] is None:
+            raise RuntimeError("checkpoint resident is no longer readable; dataset changed")
+
+    def source():
+        restoring = saved is not None
+        while True:
+            order = np.random.default_rng(
+                [dataset.seed, cursor["round_idx"], global_worker, 2]
+            ).permutation(assigned)
+            drop_rng = np.random.default_rng([dataset.seed, cursor["round_idx"], global_worker, 0])
+            if restoring:
+                drop_rng.bit_generator.state = deepcopy(saved["source"]["drop_rng"])
+                restoring = False
+            while cursor["episode_pos"] < len(order):
+                e = int(order[cursor["episode_pos"]])
+                if cursor["frame"] == dataset.num_anchors(e):
+                    cursor["episode_pos"] += 1
+                    cursor["frame"] = 0
+                    continue
+                k = cursor["frame"]
+                cursor["frame"] += 1
+                if drop_rng.random() < dataset.drop_ratio:
+                    continue
+                cursor["attempted"] += 1
+                seed = int(
+                    np.random.SeedSequence(
+                        [dataset.seed, cursor["round_idx"], global_worker, e, k, 3]
+                    ).generate_state(1)[0]
+                )
+                descriptor = (e, k, seed)
+                sample = read_window(descriptor)
+                if sample is not None:
+                    cursor["usable"] += 1
+                    state["source"] = {**cursor, "drop_rng": drop_rng.bit_generator.state}
+                    yield descriptor, sample
+            if cursor["attempted"] and not cursor["usable"]:
+                raise ValueError("all attempted source windows in this worker round failed to read")
+            cursor["round_idx"] += 1
+            cursor.update(episode_pos=0, frame=0, attempted=0, usable=0)
+
+    windows = source()
+    while True:
+        # Warm up, then grow by one per output until the buffer reaches capacity.
+        for _ in range(2 if len(buffer) < dataset.shuffle_buffer - 1 else 1):
+            descriptor, sample = next(windows)
+            queue.append(descriptor)
+            buffer.append(sample)
+        if len(buffer) < dataset.shuffle_initial:
+            continue
+        pick = int(rng.integers(len(buffer)))
+        data = preprocess(queue[pick], buffer[pick])
+        for items in (queue, buffer):
+            items[pick] = items[-1]
+            items.pop()
+        if data is None:
+            continue
+        if dataset.resume_enabled:
+            delivered += 1
+            state.update(shuffle_rng=rng.bit_generator.state, delivered=delivered)
+            data = StreamSample(data)
+            data.stream_state, data.stream_name = state, dataset.stream_name
+        yield data
 
 
 STREAM_STATE_KEY = "_stream_state"
@@ -642,132 +722,184 @@ def _json_value(value):
 
 def dataset_fingerprint(dataset, collator_config):
     """Identify metadata and preprocessing; data/video payloads must stay immutable."""
-    description = dataset.resume_description() if hasattr(dataset, "resume_description") else {
-        "info": dataset.reader.info,
-        "episodes": dataset.reader.episodes,
-        "tasks": dataset.reader.tasks,
-        "shape_meta": dataset.shape_meta,
-        "split": dataset.split,
-        "use_relative_action": dataset.use_relative_action,
-        "load_depth": dataset.load_depth,
-        "load_chest": dataset.load_chest,
-        "target_image_size": dataset.target_image_size,
-        "depth_clip_range": dataset.depth_clip_range,
-        "view_dropout": dataset.view_dropout,
-        "sanity_checks": dataset.sanity_checks,
-    }
+    description = (
+        dataset.resume_description()
+        if hasattr(dataset, "resume_description")
+        else {
+            "info": dataset.reader.info,
+            "episodes": dataset.reader.episodes,
+            "tasks": dataset.reader.tasks,
+            "shape_meta": dataset.shape_meta,
+            "split": dataset.split,
+            "use_relative_action": dataset.use_relative_action,
+            "load_depth": dataset.load_depth,
+            "load_chest": dataset.load_chest,
+            "target_image_size": dataset.target_image_size,
+            "depth_clip_range": dataset.depth_clip_range,
+            "view_dropout": dataset.view_dropout,
+            "sanity_checks": dataset.sanity_checks,
+        }
+    )
     description["collator"] = collator_config
     digest = hashlib.sha256(json.dumps(_json_value(description), sort_keys=True).encode())
     if getattr(dataset, "normalizer", None) is not None:
         for name, tensor in sorted(dataset.normalizer.state_dict().items()):
             digest.update(name.encode())
             digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
-            digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+            digest.update(
+                tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+            )
     return digest.hexdigest()
 
 
 class StreamCheckpoint:
-    """Only record a state after its batch was passed through a training step.
+    """Track consumed batches for one stream or a fixed-ratio VLA/VLM pair."""
 
-    Prefetch states are never authoritative. Failed-gradient steps also consume
-    data, so consumed_batches is separate from successful global/update steps.
-    """
-
-    def __init__(self, dataset, batch_size, num_workers, rank=0, world_size=1,
-                 micro_batches_per_epoch=None, collator_config=None, gradient_accumulation_steps=1):
-        if (batch_size < 1 or num_workers < 0 or not 0 <= rank < world_size
-                or gradient_accumulation_steps < 1
-                or (micro_batches_per_epoch is not None and micro_batches_per_epoch < 1)):
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        num_workers,
+        rank=0,
+        world_size=1,
+        micro_batches_per_epoch=None,
+        collator_config=None,
+        gradient_accumulation_steps=1,
+    ):
+        if (
+            batch_size < 1
+            or num_workers < 0
+            or not 0 <= rank < world_size
+            or gradient_accumulation_steps < 1
+            or (micro_batches_per_epoch is not None and micro_batches_per_epoch < 1)
+        ):
             raise ValueError("invalid stream loader topology")
-        self.dataset = dataset
-        self.spec = {
-            "version": 1,
-            "batch_size": int(batch_size),
-            "num_workers": int(num_workers),
-            "rank": int(rank),
-            "world_size": int(world_size),
-            "seed": dataset.seed,
-            "drop_ratio": dataset.drop_ratio,
-            "shuffle_buffer": dataset.shuffle_buffer,
-            "shuffle_initial": dataset.shuffle_initial,
-            "micro_batches_per_epoch": micro_batches_per_epoch,
-            "gradient_accumulation_steps": int(gradient_accumulation_steps),
-            "dataset_fingerprint": dataset_fingerprint(dataset, collator_config),
-        }
+        self.mixed = getattr(dataset, "vlm_dataset", None) is not None
+        self.batch_size = int(batch_size)
+        if self.mixed:
+            self.vla_ratio = float(dataset.vla_ratio)
+            vla_count = math.ceil(batch_size * self.vla_ratio)
+            if not 0 < vla_count < batch_size or dataset.batch_size != batch_size:
+                raise ValueError(
+                    "mixed dataset requires matching batch size and nonempty VLA/VLM quotas"
+                )
+            self.datasets = {"vla": dataset.vla_dataset, "vlm": dataset.vlm_dataset}
+            sizes = {"vla": vla_count, "vlm": batch_size - vla_count}
+        else:
+            self.datasets = {dataset.stream_name: dataset}
+            sizes = {dataset.stream_name: batch_size}
+        self.rank_key = f"rank_{int(rank)}"
         self.consumed_batches = 0
-        self.workers = {}
-        dataset.resume_enabled = True
-        dataset.resume_num_workers = max(1, num_workers)
-        dataset.resume_rank = int(rank)
-        dataset.resume_world_size = int(world_size)
-        dataset.resume_batches = 0
-        dataset.worker_resume_states = {}
-
-    @property
-    def rank_key(self):
-        return f"rank_{self.spec['rank']}"
+        self.specs, self.workers = {}, {}
+        for name, stream in self.datasets.items():
+            self.specs[name] = {
+                "version": 3,
+                "media_encoding": {"rgb": "jpeg", "quality": JPEG_QUALITY, "depth": "npy"},
+                "batch_size": int(sizes[name]),
+                "num_workers": int(num_workers),
+                "rank": int(rank),
+                "world_size": int(world_size),
+                "seed": stream.seed,
+                "drop_ratio": stream.drop_ratio,
+                "shuffle_buffer": stream.shuffle_buffer,
+                "shuffle_initial": stream.shuffle_initial,
+                "micro_batches_per_epoch": micro_batches_per_epoch,
+                "gradient_accumulation_steps": int(gradient_accumulation_steps),
+                "dataset_fingerprint": dataset_fingerprint(stream, collator_config),
+            }
+            self.workers[name] = {}
+            stream.resume_enabled = True
+            stream.resume_num_workers = max(1, num_workers)
+            stream.resume_rank, stream.resume_world_size = int(rank), int(world_size)
+            stream.resume_batches, stream.worker_resume_states = 0, {}
+        self.spec = next(iter(self.specs.values()))
 
     def record_consumed(self, encoded):
-        if not encoded:
-            raise ValueError("LeRobot training batch is missing its stream checkpoint state")
         state = pickle.loads(encoded)
-        worker = self.validate_consumed(state)
-        self.workers[worker] = state
-        self.consumed_batches += 1
-
-    def validate_consumed(self, state):
+        states = state.get("streams", {}) if self.mixed else {next(iter(self.datasets)): state}
+        if set(states) != set(self.datasets):
+            raise ValueError("batch stream names disagree with the configured datasets")
         nw = max(1, self.spec["num_workers"])
         worker = self.consumed_batches % nw
-        if state["worker_id"] != worker:
-            raise ValueError("unexpected worker batch order; exact resume requires in-order DataLoader")
-        expected = ((self.consumed_batches // nw) + 1) * self.spec["batch_size"]
-        if state["delivered"] != expected:
-            raise ValueError("stream batch delivery count is inconsistent with consumed batches")
-        return worker
+        for name, item in states.items():
+            expected = (self.consumed_batches // nw + 1) * self.specs[name]["batch_size"]
+            if (
+                item["worker_id"] != worker
+                or state["worker_id"] != worker
+                or item["delivered"] != expected
+            ):
+                raise ValueError("stream delivery count/order disagrees with consumed batches")
+        for name, item in states.items():
+            self.workers[name][worker] = item
+        self.consumed_batches += 1
 
     def state_dict(self):
+        streams = {}
+        for name, spec in self.specs.items():
+            payload = {
+                "spec": spec,
+                "consumed_batches": self.consumed_batches,
+                "workers": self.workers[name],
+            }
+            streams[name] = {self.rank_key: pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)}
+        if not self.mixed:
+            return next(iter(streams.values()))
         payload = {
-            "spec": self.spec,
-            "consumed_batches": self.consumed_batches,
-            "workers": self.workers,
+            "format": "vla_vlm_v1",
+            "batch_size": self.batch_size,
+            "vla_ratio": self.vla_ratio,
+            "streams": streams,
         }
-        # Rank-local keys prevent DCP from deduplicating different worker queues.
         return {self.rank_key: pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)}
 
     def load_state_dict(self, state):
         payload = pickle.loads(state[self.rank_key])
-        if payload["spec"] != self.spec:
-            changed = [key for key in self.spec if payload["spec"].get(key) != self.spec[key]]
-            raise ValueError(f"stream checkpoint mismatch: {', '.join(changed)}")
-        consumed = int(payload["consumed_batches"])
-        if consumed < 0:
-            raise ValueError("negative consumed batch count")
-        workers = payload["workers"]
-        self._validate_workers(workers, consumed)
-        self.consumed_batches = consumed
-        self.workers = workers
-        self.dataset.resume_batches = consumed
-        self.dataset.worker_resume_states = workers
-
-    def _validate_workers(self, workers, consumed):
+        if self.mixed:
+            if (
+                payload.get("format") != "vla_vlm_v1"
+                or payload["batch_size"] != self.batch_size
+                or payload["vla_ratio"] != self.vla_ratio
+            ):
+                raise ValueError("mixed stream checkpoint format or VLA/VLM ratio mismatch")
+            payloads = {
+                name: pickle.loads(item[self.rank_key]) for name, item in payload["streams"].items()
+            }
+        else:
+            payloads = {next(iter(self.datasets)): payload}
+        if set(payloads) != set(self.datasets):
+            raise ValueError("checkpoint stream names disagree with the configured datasets")
+        counts = {int(item["consumed_batches"]) for item in payloads.values()}
+        if len(counts) != 1 or min(counts) < 0:
+            raise ValueError("checkpoint consumption boundaries disagree or are negative")
+        consumed = counts.pop()
         nw = max(1, self.spec["num_workers"])
-        expected_workers = set(range(min(nw, consumed)))
-        if set(workers) != expected_workers:
-            raise ValueError("checkpoint worker set disagrees with consumed batches")
-        for wid, item in workers.items():
-            batches = (consumed + nw - 1 - wid) // nw
-            if item["worker_id"] != wid or item["delivered"] != batches * self.spec["batch_size"]:
-                raise ValueError("invalid worker delivery count in stream checkpoint")
-            if len(item["queue"]) > self.spec["shuffle_buffer"] - 1:
-                raise ValueError("checkpoint shuffle queue exceeds capacity")
+        for name, item in payloads.items():
+            spec, workers = self.specs[name], item["workers"]
+            if item["spec"] != spec:
+                changed = [key for key in spec if item["spec"].get(key) != spec[key]]
+                raise ValueError(f"stream checkpoint mismatch: {', '.join(changed)}")
+            if set(workers) != set(range(min(nw, consumed))):
+                raise ValueError("checkpoint worker set disagrees with consumed batches")
+            for wid, worker in workers.items():
+                expected = ((consumed + nw - 1 - wid) // nw) * spec["batch_size"]
+                if worker["worker_id"] != wid or worker["delivered"] != expected:
+                    raise ValueError("invalid worker delivery count in stream checkpoint")
+                if len(worker["queue"]) > spec["shuffle_buffer"] - 1:
+                    raise ValueError("checkpoint shuffle queue exceeds capacity")
+        self.consumed_batches = consumed
+        for name, item in payloads.items():
+            self.workers[name] = item["workers"]
+            self.datasets[name].resume_batches = consumed
+            self.datasets[name].worker_resume_states = item["workers"]
 
     def require_checkpoint(self, checkpoint_path):
         from torch.distributed.checkpoint import FileSystemReader
+
         keys = FileSystemReader(checkpoint_path).read_metadata().state_dict_metadata
         if f"app.data_stream.{self.rank_key}" not in keys:
             raise ValueError(
-                "checkpoint has no LeRobot stream state for this rank; exact data resume is unavailable. "
-                "Use finetune_checkpoint_path for a weights-only restart from an older checkpoint.")
+                "checkpoint has no LeRobot stream state for this rank; use finetune_checkpoint_path for weights only"
+            )
 
 
 class StreamCheckpointCollator:
@@ -778,15 +910,9 @@ class StreamCheckpointCollator:
         self.stream_names = stream_names
 
     def __call__(self, samples):
-        states = [getattr(sample, "stream_state", None) for sample in samples]
-        if not states or any(state is None for state in states):
-            raise ValueError("resume collator requires pure resumable LeRobot samples")
-        if len({state["worker_id"] for state in states}) != 1:
-            raise ValueError("one batch must belong to one stream worker")
+        states = [sample.stream_state for sample in samples]
         if self.stream_names is not None:
             streams = {sample.stream_name: sample.stream_state for sample in samples}
-            if set(streams) != set(self.stream_names):
-                raise ValueError("mixed batch is missing a stream checkpoint")
             state = {"worker_id": states[-1]["worker_id"], "streams": streams}
         else:
             state = states[-1]
@@ -795,144 +921,58 @@ class StreamCheckpointCollator:
         return result
 
 
-class MixedStreamCheckpoint:
-    """Resume fixed-ratio VLA/VLM batches at the joint consumption boundary."""
-
-    def __init__(self, dataset, batch_size, **kwargs):
-        vla_count = math.ceil(batch_size * dataset.vla_ratio)
-        vlm_count = batch_size - vla_count
-        if vla_count < 1 or vlm_count < 1:
-            raise ValueError("mixed training requires at least one VLA and one VLM sample per batch")
-        if dataset.batch_size != batch_size:
-            raise ValueError("mixed dataset batch_size must match the DataLoader")
-        if not hasattr(dataset.vlm_dataset, "resume_enabled"):
-            raise ValueError("mixed resume requires a resumable VLMLeRobotDataset")
-        self.batch_size = int(batch_size)
-        self.vla_ratio = float(dataset.vla_ratio)
-        self.streams = {
-            "vla": StreamCheckpoint(dataset.vla_dataset, batch_size=vla_count, **kwargs),
-            "vlm": StreamCheckpoint(dataset.vlm_dataset, batch_size=vlm_count, **kwargs),
-        }
-
-    @property
-    def consumed_batches(self):
-        counts = {stream.consumed_batches for stream in self.streams.values()}
-        if len(counts) != 1:
-            raise ValueError("VLA/VLM consumption boundaries disagree")
-        return counts.pop()
-
-    @property
-    def rank_key(self):
-        return self.streams["vla"].rank_key
-
-    def record_consumed(self, encoded):
-        if not encoded:
-            raise ValueError("mixed batch has no stream checkpoint state")
-        state = pickle.loads(encoded)
-        if set(state.get("streams", {})) != set(self.streams):
-            raise ValueError("mixed batch must contain VLA and VLM stream states")
-        for name, stream in self.streams.items():
-            if stream.validate_consumed(state["streams"][name]) != state["worker_id"]:
-                raise ValueError("mixed batch contains different logical workers")
-        for name, stream in self.streams.items():
-            stream.record_consumed(pickle.dumps(state["streams"][name]))
-
-    def state_dict(self):
-        payload = {
-            "format": "vla_vlm_v1", "batch_size": self.batch_size, "vla_ratio": self.vla_ratio,
-            "streams": {name: stream.state_dict() for name, stream in self.streams.items()},
-        }
-        return {self.rank_key: pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)}
-
-    def load_state_dict(self, state):
-        payload = pickle.loads(state[self.rank_key])
-        if (payload.get("format") != "vla_vlm_v1" or payload["batch_size"] != self.batch_size
-                or payload["vla_ratio"] != self.vla_ratio):
-            raise ValueError("mixed stream checkpoint format or VLA/VLM ratio mismatch")
-        for name, stream in self.streams.items():
-            stream.load_state_dict(payload["streams"][name])
-        self.consumed_batches  # validate the shared boundary before starting workers
-
-    def require_checkpoint(self, checkpoint_path):
-        self.streams["vla"].require_checkpoint(checkpoint_path)
-
-
-def worker_partition():
-    worker = torch.utils.data.get_worker_info()
-    wid, nw = (worker.id, worker.num_workers) if worker else (0, 1)
-    if dist.is_available() and dist.is_initialized():
-        rank, world = dist.get_rank(), dist.get_world_size()
-    else:
-        rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
-    if world <= 0 or not 0 <= rank < world:
-        raise ValueError(f"invalid rank/world size: {rank}/{world}")
-    return rank * nw + wid, world * nw
-
-
-class LeRobotStreamMixin:
+class LeRobotDataset(torch.utils.data.IterableDataset):
     """Common lifecycle; datasets define num_anchors, read_window and sample_to_data."""
 
     lowdim_only = False
     stream_name = "vla"
 
-    def materialize(self, e, k):
-        """Apply shared preprocessing and skip known data-quality failures."""
-        self.checker.note_sample_seen()
-        sample = {"dataset_name": self.root, "episode_index": self.reader.episodes[e]["episode_index"],
-                  "__key__": f"frame_{k}"}
-        try:
-            sample = self.read_window(e, k, load_media=not self.lowdim_only)
-            start = time.perf_counter()
-            data = self.sample_to_data(sample)
-        except DataSkipError as exc:
-            self.checker.log_skip(current_worker_id(), exc, sample)
-            return None
-        transform_s = time.perf_counter() - start
-        data = dict_apply(data, lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x)
-        if getattr(self, "debug_profile_timing", False) and not self.lowdim_only:
-            data["debug_sample_profile"] = {
-                "worker_id": current_worker_id(),
-                "sample_to_data_s": transform_s,
-                "preprocess_total_s": time.perf_counter() - start,
-            }
-        return data
+    reader_type = LeRobotEpisodeReader
 
-    def materialize_with_context(self, e, k):
-        """Attach the episode/frame locator to unexpected read or transform errors."""
-        try:
-            return self.materialize(e, k)
-        except Exception as exc:
-            episode_id = self.reader.episodes[e]["episode_index"]
-            raise RuntimeError(
-                f"LeRobot data error: root={self.root}, episode={episode_id}, frame={k}"
-            ) from exc
+    def __init__(
+        self,
+        root,
+        *,
+        split,
+        val_split,
+        seed,
+        mode,
+        drop_ratio,
+        shuffle_buffer,
+        shuffle_initial,
+        val_stride,
+        reader_kwargs,
+        target_image_size,
+        sanity_checks,
+        return_dataset_info,
+    ):
+        super().__init__()
+        if (
+            mode not in ("train", "val")
+            or not 0 <= drop_ratio < 1
+            or val_stride < 1
+            or shuffle_buffer < 1
+            or (shuffle_initial is not None and shuffle_initial < 1)
+        ):
+            raise ValueError("invalid stream sampling configuration")
+        self.root, self.split, self.val_split = str(root), split, val_split
+        self.mode, self.seed = mode, int(seed)
+        self.drop_ratio, self.val_stride = float(drop_ratio), int(val_stride)
+        self.shuffle_buffer = shuffle_buffer
+        self.shuffle_initial = min(shuffle_buffer, shuffle_initial or shuffle_buffer)
+        self.target_image_size = tuple(target_image_size) if target_image_size is not None else None
+        self.return_dataset_info = return_dataset_info
+        self.sanity_checks = dict(sanity_checks or {})
+        self.checker = DataChecker(sanity_cfg=self.sanity_checks)
+        self.collator = None
+        self.reader_kwargs = dict(reader_kwargs or {})
+        self.reader = self.reader_type(root, split, **self.reader_kwargs)
+        self.resume_enabled = False
+        self.resume_batches = self.resume_rank = 0
+        self.resume_num_workers = self.resume_world_size = 1
+        self.worker_resume_states = {}
 
-    def iter_samples(self, global_worker, total_workers, logical_worker=None):
-        if total_workers < 1 or not 0 <= global_worker < total_workers:
-            raise ValueError("invalid worker partition")
-        valid = np.array([e for e in range(len(self.reader.episodes)) if self.num_anchors(e) > 0], dtype=np.int64)
-        assigned = valid[global_worker::total_workers]
-        if not len(assigned):
-            if self.mode == "val":
-                return
-            raise ValueError("each training worker needs an episode; reduce workers or add data")
-        if self.mode == "train":
-            logical_worker = global_worker if logical_worker is None else logical_worker
-            saved = self.worker_resume_states.get(logical_worker) if self.resume_enabled else None
-            yield from ResumableEpisodeStream(self, assigned, global_worker, logical_worker, saved)
-            return
-        seen = 0
-        for e in assigned:
-            for k in range(self.num_anchors(e)):
-                keep = seen % self.val_stride == 0
-                seen += 1
-                if not keep:
-                    continue
-                sample = self.materialize_with_context(int(e), k)
-                if sample is not None:
-                    yield sample
-
-    def __iter__(self):
+    def build_pipeline(self):
         self.reader.reset_caches()
         worker = torch.utils.data.get_worker_info()
         wid, nw = (worker.id, worker.num_workers) if worker else (0, 1)
@@ -946,14 +986,40 @@ class LeRobotStreamMixin:
             global_worker = self.resume_rank * nw + logical
             total_workers = self.resume_world_size * nw
         else:
-            global_worker, total_workers = worker_partition()
-        yield from self.iter_samples(global_worker, total_workers, logical)
+            if dist.is_available() and dist.is_initialized():
+                rank, world = dist.get_rank(), dist.get_world_size()
+            else:
+                rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+            if world <= 0 or not 0 <= rank < world:
+                raise ValueError(f"invalid rank/world size: {rank}/{world}")
+            global_worker, total_workers = rank * nw + wid, world * nw
+        return build_lerobot_pipeline(self, global_worker, total_workers, logical)
 
-    def build_pipeline(self):
-        return iter(self)
+    def __iter__(self):
+        return iter(self.build_pipeline())
+
+    def get_validation_dataset(self):
+        dataset = deepcopy(self)
+        dataset.mode, dataset.split = "val", self.val_split
+        if hasattr(dataset, "aug_transform"):
+            dataset.aug_transform = False
+        dataset.resume_enabled = False
+        dataset.worker_resume_states = {}
+        dataset.reader = self.reader_type(self.root, self.val_split, **self.reader_kwargs)
+        return dataset
+
+    def set_collator(self, collator):
+        self.collator = collator
 
     def get_collator(self):
-        collator = super().get_collator()
+        assert self.collator is not None, "Collator not set"
+        collator = UnifiedVLACollator(
+            formatter=self.collator.formatter,
+            batch_processor=deepcopy(self.collator.batch_processor),
+            mode=self.mode,
+            debug_capture_texts=self.collator.debug_capture_texts,
+            debug_profile_timing=self.collator.debug_profile_timing,
+        )
         if self.mode == "train" and self.resume_enabled:
             return StreamCheckpointCollator(collator)
         return collator

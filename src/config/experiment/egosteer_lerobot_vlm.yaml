@@ -16,7 +16,7 @@ dataset:
     weights: [0.5, 0.5, 0.5]
     seed: ${training.seed}
     target_image_size: ${data.target_image_size}
-    shuffle_buffer: 4096
+    shuffle_buffer: 16384
     shuffle_initial: 4096
     drop_ratio: 0.0
     sanity_checks: ${data.sanity_checks}

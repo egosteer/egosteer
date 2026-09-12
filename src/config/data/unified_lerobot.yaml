@@ -81,12 +81,12 @@ dataset:
     val_stride: 1
     seed: ${training.seed}
     drop_ratio: 0.8
-    # Decoded samples, per worker: unlike WDS this is NOT a compressed buffer.
-    shuffle_buffer: 4096
+    # Per-worker WDS media windows: resize, JPEG quality 80 / depth NPY, shuffle.
+    shuffle_buffer: 16384
     shuffle_initial: 4096
     reader_kwargs:
       row_group_cache_size: 8
-      frame_cache_size: 256
+      frame_cache_size: 256  # Resized decoded frames per active video; JPEG windows remain independent
       video_reader_cache_size: 4
   vlm_dataset: null
   vla_ratio: 1
