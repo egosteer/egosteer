@@ -25,11 +25,13 @@ class FSDPWorkspaceAppState(Stateful):
         optimizer,
         lr_scheduler,
         training_state,
+        data_stream=None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.training_state = training_state
+        self.data_stream = data_stream
         self._options = StateDictOptions(strict=True)
 
     def state_dict(self) -> dict[str, Any]:
@@ -38,12 +40,15 @@ class FSDPWorkspaceAppState(Stateful):
             self.optimizer,
             options=self._options,
         )
-        return {
+        state = {
             "model": model_state_dict,
             "optimizer": optim_state_dict,
             "lr_scheduler": self.lr_scheduler.state_dict(),
             "training_state": self.training_state.state_dict(),
         }
+        if self.data_stream is not None:
+            state["data_stream"] = self.data_stream.state_dict()
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         incompatible_keys = set_state_dict(
@@ -62,6 +67,8 @@ class FSDPWorkspaceAppState(Stateful):
 
         self.lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
         self.training_state.load_state_dict(state_dict["training_state"])
+        if self.data_stream is not None:
+            self.data_stream.load_state_dict(state_dict["data_stream"])
 
 
 class FSDPModelOnlyAppState(Stateful):

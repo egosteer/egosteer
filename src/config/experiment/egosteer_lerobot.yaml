@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - /model: qwen3_vl_2b
+  - /data: unified_lerobot
+  - /training: default
+  - /logging: default
+  - /dataset_paths/vla_lerobot
+  - /world_model: frozen_regression
+  - _self_
+
+name: egosteer_lerobot
+exp_name: egosteer_lerobot
+_target_: src.workspace.train_egosteer_workspace.TrainEgoSteerWorkspace
+training:
+  normalizer_path: outputs/normalizer/lerobot/normalizer.pkl

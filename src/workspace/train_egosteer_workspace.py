@@ -15,6 +15,7 @@ import pickle
 import random
 import time
 from contextlib import nullcontext
+from itertools import islice
 
 import hydra
 import numpy as np
@@ -227,7 +228,7 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
         self.vlm_freeze_updates, self.vlm_rewarmup_updates = self.get_vlm_stage_steps(cfg.training)
 
         # Dataset + dataloaders.
-        print("--> Configure WebDataset dataset and dataloader...")
+        print("--> Configure streaming dataset and dataloader...")
         dataset = hydra.utils.instantiate(cfg.dataset)
         self.use_relative_action = dataset.vla_dataset.use_relative_action
         print("--> dataset instantiated")
@@ -239,7 +240,7 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
             dataset.vlm_dataset.set_collator(data_collator)
 
         assert cfg.training.normalizer_path is not None, (
-            "WebDataset training requires a pre-computed normalizer_path."
+            "Streaming training requires a pre-computed normalizer_path."
         )
         print("Loading normalizer...")
         with open(cfg.training.normalizer_path, "rb") as f:
@@ -249,6 +250,19 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
 
         webloader_cfg = cfg.dataloader.get("webloader", {}) or {}
         use_webloader = bool(webloader_cfg.get("use_webloader", False))
+        self.data_stream = None
+        if hasattr(dataset.vla_dataset, "resume_enabled"):
+            if use_webloader or dataset.vlm_dataset is not None or not cfg.dataloader.loader.get("in_order", True):
+                raise ValueError("LeRobot data resume requires the plain, in-order, VLA-only DataLoader")
+            from src.dataset.stream_checkpoint import StreamCheckpoint
+            self.data_stream = StreamCheckpoint(
+                dataset.vla_dataset, batch_size=cfg.dataloader.loader.batch_size,
+                num_workers=cfg.dataloader.loader.num_workers, rank=rank, world_size=world_size,
+                micro_batches_per_epoch=int(cfg.training.get("steps_per_epoch", 100000))
+                    * int(cfg.training.get("gradient_accumulation_steps", 1)),
+                collator_config=OmegaConf.to_container(cfg.data_collator, resolve=True),
+                gradient_accumulation_steps=int(cfg.training.get("gradient_accumulation_steps", 1)),
+            )
         if use_webloader:
             import webdataset as wds
             train_loader_kwargs = dict(cfg.dataloader.loader)
@@ -364,16 +378,21 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                 print(f"[ckpt] resume: loading full workspace state from {cfg.training.resume_checkpoint_path}")
             # Same as load_checkpoint(): DCP .metadata pickle compat (e.g. Py3.13 pathlib on Py3.10 workers).
             enable_pathlib_local_pickle_compat()
+            if self.data_stream is not None:
+                self.data_stream.require_checkpoint(cfg.training.resume_checkpoint_path)
             app_state = FSDPWorkspaceAppState(
                 model=self.model,
                 optimizer=self.optimizer,
                 lr_scheduler=self.lr_scheduler,
                 training_state=self.training_state,
+                data_stream=self.data_stream,
             )
             dcp.load({APP_STATE_KEY: app_state}, checkpoint_id=cfg.training.resume_checkpoint_path)
             self.update_step = self.training_state.update_step
             self.global_step = self.training_state.global_step
             self.epoch = self.training_state.epoch
+            if self.data_stream is not None:
+                self.epoch = self.data_stream.consumed_batches // micro_batches_per_epoch
             if rank == 0:
                 print(
                     f"[ckpt] resume: restored update_step={self.update_step} "
@@ -503,6 +522,14 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
         gc_handler = GarbageCollection(gc_freq=100, full_gc_freq=2000)
         training_start_time = None
         total_samples_processed = 0
+        data_stream = getattr(self, "data_stream", None)
+        start_batch = 0
+        stream_iterator = None
+        if data_stream is not None:
+            # Counts every consumed microbatch, including skipped-gradient
+            # steps. Also handles checkpoints saved on the last batch of an epoch.
+            self.epoch, start_batch = divmod(data_stream.consumed_batches, micro_batches_per_epoch)
+            stream_iterator = iter(train_dataloader)
 
         with profile_context as prof:
             if rank == 0:
@@ -516,10 +543,12 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                 if rank == 0:
                     print(f"Training epoch {self.epoch} started")
                 step_perf_end = time.perf_counter()
-                for batch_idx, batch in enumerate(train_dataloader):
+                epoch_iterator = stream_iterator if stream_iterator is not None else iter(train_dataloader)
+                # Bound before requesting next(): the old loop fetched and
+                # discarded one extra batch at each artificial epoch boundary.
+                batches = islice(epoch_iterator, micro_batches_per_epoch - start_batch)
+                for batch_idx, batch in enumerate(batches, start=start_batch):
                     data_wait_sec = time.perf_counter() - step_perf_end
-                    if batch_idx >= micro_batches_per_epoch:
-                        break
 
                     step_perf_start = time.perf_counter()
                     if training_start_time is None:
@@ -527,9 +556,12 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                     if cfg.training.profile and torch.cuda.is_available():
                         torch.cuda.reset_peak_memory_stats()
 
+                    stream_state = batch.pop("_stream_state", None)
                     sync_gradients, step_skipped, raw_loss, part_grad_norms = self.train_step(
                         batch, batch_idx, grad_accum_steps, cfg, rank,
                     )
+                    if data_stream is not None:
+                        data_stream.record_consumed(stream_state)
 
                     if step_skipped:
                         step_perf_end = time.perf_counter()
@@ -582,6 +614,7 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                 if cfg.training.max_train_steps and self.update_step >= cfg.training.max_train_steps:
                     break
                 self.epoch += 1
+                start_batch = 0
 
         gc_handler.finalize()
 

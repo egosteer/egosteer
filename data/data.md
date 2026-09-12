@@ -1,5 +1,8 @@
 # Data
 
+For the released EgoSteer-RealWorld LeRobot v3 stream, its complete field mapping
+and training configuration, see [LeRobot streaming data](lerobot.md).
+
 This document describes the EgoSteer data format and how to convert your own
 data into it. To train on the small example dataset first, see the
 [Quick Start](../README.md#quick-start) in the main README.

@@ -85,6 +85,7 @@ def save_checkpoint_native(workspace, rank, path=None, tag='latest'):
         optimizer=workspace.optimizer,
         lr_scheduler=workspace.lr_scheduler,
         training_state=workspace.training_state,
+        data_stream=getattr(workspace, "data_stream", None),
     )
     dcp.save({APP_STATE_KEY: app_state}, checkpoint_id=str(path))
     if rank == 0:
