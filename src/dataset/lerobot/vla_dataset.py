@@ -4,9 +4,10 @@ from copy import deepcopy
 
 import numpy as np
 
-from .base_dataset import LeRobotStreamMixin
-from .lerobot_dataset import LeRobotEpisodeReader
-from .schema import camera_parameters, unpack_motion
+from .lerobot_dataset import (
+    LeRobotEpisodeReader, LeRobotStreamMixin, StreamCheckpointCollator,
+    camera_parameters, unpack_motion,
+)
 from ..unified_vla_collator import ConcatDataCollator
 from ..unified_dataset import UnifiedDataset
 from ..wds.vla_dataset import VLAWdsDataset, VLALowLevelWdsDataset
@@ -178,7 +179,6 @@ class UnifiedLeRobotDataset(UnifiedDataset):
     def get_collator(self):
         collator = super().get_collator()
         if self.mode == "train" and self.vlm_dataset is not None and self.vla_dataset.resume_enabled:
-            from .checkpoint import StreamCheckpointCollator
             if isinstance(collator, StreamCheckpointCollator):
                 collator = collator.collator
             return StreamCheckpointCollator(collator, stream_names=("vla", "vlm"))

@@ -13,14 +13,9 @@ src/dataset/
     vla_dataset.py       # VLAWdsDataset / VLALowLevelWdsDataset / UnifiedWdsDataset
     vlm_dataset.py       # VLMWdsDataset
   lerobot/
-    lerobot_dataset.py   # LeRobotEpisodeReader：Parquet / metadata / 视频定位
+    lerobot_dataset.py   # 字段映射、Parquet / 视频读取、shuffle、worker 与 resume
     vla_dataset.py       # VLALeRobotDataset / VLALowLevelLeRobotDataset / UnifiedLeRobotDataset
     vlm_dataset.py       # VLMLeRobotDataset：独立 Parquet 图文问答源
-    base_dataset.py      # 两个流共用的 worker / materialize / resume 生命周期
-    stream.py           # 顺序游标与可恢复 shuffle
-    checkpoint.py       # 消费边界状态与 DCP 接入
-    schema.py           # 字段布局与 74D 映射
-    video.py            # RGB / depth 解码与缓存
   unified_dataset.py    # 两种 backend 共用的 VLA/VLM 包装器
   data_transforms.py    # 共用变换和 ViewDropoutConfig
   unified_vla_collator.py

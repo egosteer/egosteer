@@ -254,7 +254,7 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
         if hasattr(dataset.vla_dataset, "resume_enabled"):
             if use_webloader or not cfg.dataloader.loader.get("in_order", True):
                 raise ValueError("LeRobot data resume requires the plain, in-order DataLoader")
-            from src.dataset.lerobot.checkpoint import StreamCheckpoint, MixedStreamCheckpoint
+            from src.dataset.lerobot.lerobot_dataset import StreamCheckpoint, MixedStreamCheckpoint
             checkpoint_type = StreamCheckpoint if dataset.vlm_dataset is None else MixedStreamCheckpoint
             checkpoint_dataset = dataset.vla_dataset if dataset.vlm_dataset is None else dataset
             self.data_stream = checkpoint_type(

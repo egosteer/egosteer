@@ -9,8 +9,7 @@ from PIL import Image
 
 from ..sanity_checks import MissingOrInvalidFilesError
 from ..wds.vlm_dataset import VLMWdsDataset
-from .base_dataset import LeRobotStreamMixin
-from .lerobot_dataset import LeRobotEpisodeReader
+from .lerobot_dataset import LeRobotEpisodeReader, LeRobotStreamMixin
 
 
 QA_FIELDS = ("texts", "formatting_ratings", "visual_dependency_ratings", "relevance_ratings")
