@@ -546,11 +546,14 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                     print(f"Training epoch {self.epoch} started")
                 step_perf_end = time.perf_counter()
                 epoch_iterator = stream_iterator if stream_iterator is not None else iter(train_dataloader)
-                # Bound before requesting next(): the old loop fetched and
-                # discarded one extra batch at each artificial epoch boundary.
-                batches = islice(epoch_iterator, micro_batches_per_epoch - start_batch)
-                for batch_idx, batch in enumerate(batches, start=start_batch):
+                # LeRobot must not discard a batch outside its resume accounting.
+                # WDS retains the original fetch-then-check epoch boundary.
+                if data_stream is not None:
+                    epoch_iterator = islice(epoch_iterator, micro_batches_per_epoch - start_batch)
+                for batch_idx, batch in enumerate(epoch_iterator, start=start_batch):
                     data_wait_sec = time.perf_counter() - step_perf_end
+                    if batch_idx >= micro_batches_per_epoch:
+                        break
 
                     step_perf_start = time.perf_counter()
                     if training_start_time is None:
