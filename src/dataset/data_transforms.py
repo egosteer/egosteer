@@ -3,6 +3,7 @@ Data transformation functions for EgoSteer datasets.
 '''
 
 import random
+from dataclasses import dataclass
 from typing import Optional
 
 # Source: https://albumentations.ai/docs/benchmarks/image-benchmarks/
@@ -35,6 +36,25 @@ COLOR_AUG = A.ColorJitter(
     hue=0,
     p=1.0,
 )
+
+
+@dataclass(frozen=True)
+class ViewDropoutConfig:
+    """Per-sample view dropout (train only). keep_both is the implicit residual."""
+    drop_head: float = 0.0
+    drop_chest: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.drop_head < 0.0 or self.drop_chest < 0.0:
+            raise ValueError(
+                f"view_dropout probabilities must be non-negative, "
+                f"got drop_head={self.drop_head}, drop_chest={self.drop_chest}"
+            )
+        if self.drop_head + self.drop_chest > 1.0 + 1e-6:
+            raise ValueError(
+                f"drop_head + drop_chest must be <= 1.0, "
+                f"got {self.drop_head + self.drop_chest:.6f}"
+            )
 
 
 def get_relative_action(state, action):

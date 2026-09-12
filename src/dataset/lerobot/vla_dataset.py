@@ -1,33 +1,15 @@
 """LeRobot episode stream with EgoSteer's existing BC sample semantics."""
 
-import os
-import time
 from copy import deepcopy
 
 import numpy as np
-import torch
-import torch.distributed as dist
 
-from src.utils.pytorch_util import dict_apply
-
-from .lerobot_reader import LeRobotEpisodeReader
-from .lerobot_schema import camera_parameters, unpack_motion
-from .lerobot_stream import ResumableEpisodeStream
-from .sanity_checks import DataSkipError, current_worker_id
-from .unified_vla_collator import ConcatDataCollator
-from .vla_dataset import VLAWdsDataset, VLALowLevelWdsDataset
-
-
-def worker_partition():
-    worker = torch.utils.data.get_worker_info()
-    wid, nw = (worker.id, worker.num_workers) if worker else (0, 1)
-    if dist.is_available() and dist.is_initialized():
-        rank, world = dist.get_rank(), dist.get_world_size()
-    else:
-        rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
-    if world <= 0 or not 0 <= rank < world:
-        raise ValueError(f"invalid rank/world size: {rank}/{world}")
-    return rank * nw + wid, world * nw
+from .base_dataset import LeRobotStreamMixin
+from .lerobot_dataset import LeRobotEpisodeReader
+from .schema import camera_parameters, unpack_motion
+from ..unified_vla_collator import ConcatDataCollator
+from ..unified_dataset import UnifiedDataset
+from ..wds.vla_dataset import VLAWdsDataset, VLALowLevelWdsDataset
 
 
 def history_indices(k, horizon, stride, mode):
@@ -40,7 +22,7 @@ def future_indices(k, length, horizon, stride, mode, offset=0):
     return [min(i, length - 1) for i in ids] if mode == "repeat" else [i for i in ids if i < length]
 
 
-class VLALeRobotStreamDataset(VLAWdsDataset):
+class VLALeRobotDataset(LeRobotStreamMixin, VLAWdsDataset):
     """Sequential LeRobot windows with EgoSteer's shared transforms and collator.
 
     Workers own disjoint episodes and shuffle complete samples. Action targets
@@ -100,7 +82,10 @@ class VLALeRobotStreamDataset(VLAWdsDataset):
 
     def __len__(self):
         """Number of anchors before drop/val_stride; train iteration is infinite."""
-        return sum(max(0, int(ep["length"]) - 1) for ep in self.reader.episodes)
+        return sum(self.num_anchors(e) for e in range(len(self.reader.episodes)))
+
+    def num_anchors(self, e):
+        return max(0, int(self.reader.episodes[e]["length"]) - 1)
 
     def read_window(self, e, k, load_media=True):
         """Build the raw wrist/hand window consumed by sample_to_data."""
@@ -159,87 +144,6 @@ class VLALeRobotStreamDataset(VLAWdsDataset):
                     extrinsic[None], len(future_ids), axis=0,
                 )
 
-    def materialize(self, e, k):
-        """Apply shared preprocessing and skip known data-quality failures."""
-        sample = self.read_window(e, k, load_media=not self.lowdim_only)
-        self.checker.note_sample_seen()
-        start = time.perf_counter()
-        try:
-            data = self.sample_to_data(sample)
-        except DataSkipError as exc:
-            self.checker.log_skip(current_worker_id(), exc, sample)
-            return None
-        transform_s = time.perf_counter() - start
-        data = dict_apply(data, lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x)
-        if self.debug_profile_timing and not self.lowdim_only:
-            data["debug_sample_profile"] = {
-                "worker_id": current_worker_id(),
-                "sample_to_data_s": transform_s,
-                "preprocess_total_s": time.perf_counter() - start,
-            }
-        return data
-
-    def materialize_with_context(self, e, k):
-        """Attach the episode/frame locator to unexpected read or transform errors."""
-        try:
-            return self.materialize(e, k)
-        except Exception as exc:
-            episode_id = self.reader.episodes[e]["episode_index"]
-            raise RuntimeError(
-                f"LeRobot data error: root={self.root}, episode={episode_id}, frame={k}"
-            ) from exc
-
-    def iter_samples(self, global_worker, total_workers, logical_worker=None):
-        if total_workers < 1 or not 0 <= global_worker < total_workers:
-            raise ValueError("invalid worker partition")
-        valid = np.array([e for e, ep in enumerate(self.reader.episodes) if ep["length"] > 1], dtype=np.int64)
-        assigned = valid[global_worker::total_workers]
-        if not len(assigned):
-            if self.mode == "val":
-                return
-            raise ValueError("each training worker needs an episode; reduce workers or add data")
-        if self.mode == "train":
-            logical_worker = global_worker if logical_worker is None else logical_worker
-            saved = self.worker_resume_states.get(logical_worker) if self.resume_enabled else None
-            yield from ResumableEpisodeStream(self, assigned, global_worker, logical_worker, saved)
-            return
-        seen = 0
-        for e in assigned:
-            for k in range(int(self.reader.episodes[e]["length"]) - 1):
-                keep = seen % self.val_stride == 0
-                seen += 1
-                if not keep:
-                    continue
-                sample = self.materialize_with_context(int(e), k)
-                if sample is not None:
-                    yield sample
-
-    def __iter__(self):
-        self.reader.reset_caches()
-        worker = torch.utils.data.get_worker_info()
-        wid, nw = (worker.id, worker.num_workers) if worker else (0, 1)
-        logical = wid
-        if self.mode == "train" and self.resume_enabled:
-            if nw != self.resume_num_workers:
-                raise ValueError("resume worker count differs from the configured DataLoader")
-            # A new DataLoader begins at physical worker 0. Rotate logical
-            # ownership to the worker that would deliver the next saved batch.
-            logical = (wid + self.resume_batches) % nw
-            global_worker = self.resume_rank * nw + logical
-            total_workers = self.resume_world_size * nw
-        else:
-            global_worker, total_workers = worker_partition()
-        yield from self.iter_samples(global_worker, total_workers, logical)
-
-    def build_pipeline(self):
-        return iter(self)
-
-    def get_collator(self):
-        collator = super().get_collator()
-        if self.mode == "train" and self.resume_enabled:
-            from .stream_checkpoint import StreamCheckpointCollator
-            return StreamCheckpointCollator(collator)
-        return collator
 
     def get_validation_dataset(self):
         dataset = deepcopy(self)
@@ -252,7 +156,7 @@ class VLALeRobotStreamDataset(VLAWdsDataset):
         return dataset
 
 
-class VLALowLevelLeRobotDataset(VLALeRobotStreamDataset):
+class VLALowLevelLeRobotDataset(VLALeRobotDataset):
     """Scan all train-split anchors once, without video, thinning or padded rows."""
 
     lowdim_only = True
@@ -266,3 +170,16 @@ class VLALowLevelLeRobotDataset(VLALeRobotStreamDataset):
 
     def get_collator(self):
         return ConcatDataCollator()
+
+
+class UnifiedLeRobotDataset(UnifiedDataset):
+    """Unified LeRobot VLA/VLM stream with joint checkpoint boundaries."""
+
+    def get_collator(self):
+        collator = super().get_collator()
+        if self.mode == "train" and self.vlm_dataset is not None and self.vla_dataset.resume_enabled:
+            from .checkpoint import StreamCheckpointCollator
+            if isinstance(collator, StreamCheckpointCollator):
+                collator = collator.collator
+            return StreamCheckpointCollator(collator, stream_names=("vla", "vlm"))
+        return collator

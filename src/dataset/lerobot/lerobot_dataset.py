@@ -8,12 +8,16 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .lerobot_schema import CALIBRATION_SHAPES, EPISODE_COLUMNS, FRAME_COLUMNS, VIDEO_KEYS
-from .lerobot_video import VideoFrameCache, depth_parameters
+from .schema import CALIBRATION_SHAPES, EPISODE_COLUMNS, FRAME_COLUMNS, VIDEO_KEYS
+from .video import VideoFrameCache, depth_parameters
 
 
 class LeRobotEpisodeReader:
     """Read one episode split with projected Parquet columns and worker-local caches."""
+
+    frame_columns = FRAME_COLUMNS
+    episode_columns = EPISODE_COLUMNS
+    video_keys = VIDEO_KEYS
 
     def __init__(self, root, split, row_group_cache_size=8, frame_cache_size=256,
                  video_reader_cache_size=4):
@@ -28,10 +32,10 @@ class LeRobotEpisodeReader:
         self._validate_features()
         self.depth_params = {
             key: depth_parameters(self.info["features"][key])
-            for key in VIDEO_KEYS if key.endswith("_depth")
+            for key in self.video_keys if key.endswith("_depth")
         }
         self.data_template = self.info["data_path"]
-        self.video_template = self.info["video_path"]
+        self.video_template = self.info["video_path"] if self.video_keys else None
         self.tasks = self._read_tasks()
         self.episodes = self._read_episodes()
         self.blocks = self._index_row_groups()
@@ -79,10 +83,10 @@ class LeRobotEpisodeReader:
         episodes = []
         for path in metadata_paths:
             names = set(pq.read_schema(path).names)
-            missing = EPISODE_COLUMNS - names
+            missing = self.episode_columns - names
             if missing:
                 raise ValueError(f"{path}: missing release metadata {sorted(missing)}")
-            columns = sorted(EPISODE_COLUMNS | ({"split"} & names))
+            columns = sorted(self.episode_columns | ({"split"} & names))
             table = pq.read_table(path, columns=columns)
             ids = np.asarray(table["episode_index"])
             table = table.take(pa.array(np.flatnonzero((ids >= start) & (ids < stop))))
@@ -95,11 +99,8 @@ class LeRobotEpisodeReader:
         return episodes
 
     def _validate_episode(self, row):
+        self._validate_episode_bounds(row)
         eid = row["episode_index"]
-        if int(row["length"]) <= 0 or row["dataset_to_index"] - row["dataset_from_index"] != row["length"]:
-            raise ValueError(f"episode {eid}: invalid length/global index interval")
-        if "split" in row and row["split"] != self.split:
-            raise ValueError(f"episode {eid}: split column disagrees with info.json")
         if not isinstance(row["tasks"], list) or len(row["tasks"]) != 1 or row["tasks"][0] not in self.tasks.values():
             raise ValueError(f"episode {eid}: tasks must contain one vocabulary task name")
         if (not isinstance(row["instructions"], list) or not row["instructions"]
@@ -113,7 +114,18 @@ class LeRobotEpisodeReader:
             row[field] = array.reshape(shape)
         if not np.allclose(row["calibration.head_world2cam"], np.eye(4), atol=1e-6):
             raise ValueError(f"episode {eid}: head_world2cam must be identity")
-        for key in VIDEO_KEYS:
+        self._validate_video_intervals(row, self.video_keys)
+
+    def _validate_episode_bounds(self, row):
+        eid = row["episode_index"]
+        if int(row["length"]) <= 0 or row["dataset_to_index"] - row["dataset_from_index"] != row["length"]:
+            raise ValueError(f"episode {eid}: invalid length/global index interval")
+        if "split" in row and row["split"] != self.split:
+            raise ValueError(f"episode {eid}: split column disagrees with info.json")
+
+    def _validate_video_intervals(self, row, keys):
+        eid = row["episode_index"]
+        for key in keys:
             prefix = f"videos/{key}"
             first, last = (float(row[f"{prefix}/{s}_timestamp"]) for s in ("from", "to"))
             if not (np.isfinite(first) and np.isfinite(last) and 0 <= first < last):
@@ -135,7 +147,7 @@ class LeRobotEpisodeReader:
             files.setdefault(str(self.data_path(episode)), []).append(e)
         for path, positions in files.items():
             with pq.ParquetFile(path) as file:
-                missing = set(FRAME_COLUMNS) - set(file.schema_arrow.names)
+                missing = set(self.frame_columns) - set(file.schema_arrow.names)
                 if missing:
                     raise ValueError(f"{path}: missing frame columns {sorted(missing)}")
                 column = file.schema.names.index("episode_index")
@@ -174,10 +186,9 @@ class LeRobotEpisodeReader:
         self.files.move_to_end(path)
         return self.files[path]
 
-    def _read_row_group(self, file, path, group, column):
-        key = (path, group, column)
+    def _read_row_group(self, file, path, group, columns):
+        key = (path, group, tuple(columns))
         if key not in self.row_groups:
-            columns = [column, "frame_index", "episode_index", "index", "task_index", "timestamp"]
             self.row_groups[key] = file.read_row_group(group, columns=columns)
             while len(self.row_groups) > self.row_group_cache_size:
                 self.row_groups.popitem(last=False)
@@ -188,19 +199,32 @@ class LeRobotEpisodeReader:
         """Return requested 74D rows in requested order, selecting in Arrow first."""
         if column not in ("observation.state", "action"):
             raise ValueError(f"not a motion column: {column}")
+        rows = self.read_rows(e, indices, [column, "task_index"])
+        episode = self.episodes[e]
+        for k, row in rows.items():
+            if self.tasks.get(int(row["task_index"])) != episode["tasks"][0]:
+                raise ValueError(f"episode {episode['episode_index']} frame {k}: inconsistent task")
+        array = np.asarray([rows[int(k)][column] for k in indices], dtype=np.float32)
+        if array.shape != (len(indices), 74) or not np.isfinite(array).all():
+            raise ValueError(f"{column}: expected finite [T,74] values")
+        return array
+
+    def read_rows(self, e, indices, columns):
+        """Project requested frame fields, preserving episode/frame identity."""
         episode = self.episodes[e]
         indices = np.asarray(indices, dtype=np.int64)
         if indices.ndim != 1 or not len(indices) or indices.min() < 0 or indices.max() >= episode["length"]:
             raise IndexError("frame indices outside episode")
         path = str(self.data_path(episode))
         file = self._get_file(path)
+        columns = sorted(set(columns) | {"episode_index", "frame_index", "index", "timestamp"})
         frame_column = file.schema.names.index("frame_index")
         tables = []
         for group in self.blocks[e]:
             stats = file.metadata.row_group(group).column(frame_column).statistics
             if stats is not None and stats.has_min_max and not np.any((indices >= stats.min) & (indices <= stats.max)):
                 continue
-            table = self._read_row_group(file, path, group, column)
+            table = self._read_row_group(file, path, group, columns)
             select = (np.asarray(table["episode_index"]) == episode["episode_index"])
             select &= np.isin(np.asarray(table["frame_index"]), indices)
             if select.any():
@@ -211,16 +235,12 @@ class LeRobotEpisodeReader:
             raise ValueError(f"episode {episode['episode_index']}: missing/duplicate frame indices")
         for k, row in rows.items():
             if (row["index"] != episode["dataset_from_index"] + k
-                    or not np.isclose(row["timestamp"], k / self.fps, atol=1e-5)
-                    or self.tasks.get(int(row["task_index"])) != episode["tasks"][0]):
-                raise ValueError(f"episode {episode['episode_index']} frame {k}: inconsistent index/time/task")
-        array = np.asarray([rows[int(k)][column] for k in indices], dtype=np.float32)
-        if array.shape != (len(indices), 74) or not np.isfinite(array).all():
-            raise ValueError(f"{column}: expected finite [T,74] values")
-        return array
+                    or not np.isclose(row["timestamp"], k / self.fps, atol=1e-5)):
+                raise ValueError(f"episode {episode['episode_index']} frame {k}: inconsistent index/time")
+        return rows
 
     def read_media(self, e, key, indices):
-        if key not in VIDEO_KEYS:
+        if key not in self.video_keys:
             raise ValueError(f"unsupported release video feature {key}")
         episode = self.episodes[e]
         if not len(indices) or min(indices) < 0 or max(indices) >= episode["length"]:

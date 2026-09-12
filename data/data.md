@@ -175,7 +175,7 @@ These three `*_ratings` are per-turn quality scores carried over from [FineVisio
    ```yaml
    dataset:
      vlm_dataset:
-       _target_: src.dataset.vlm_dataset.VLMWdsDataset
+       _target_: src.dataset.wds.vlm_dataset.VLMWdsDataset
        wds_datasets: ${vlm_wds_datasets}
        val_wds_datasets: ${val_vlm_wds_datasets}
        weights: [0.5, 0.5, 0.5]

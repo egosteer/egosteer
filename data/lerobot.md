@@ -4,6 +4,37 @@
 数据开源 · 工作档案》（2026-08-31），适配**已发布产物的实际 schema**。
 格式版本 `v3.0` 与官方 Python 工具包版本 `lerobot 0.6.1` 是两回事。
 
+## 代码组织
+
+```text
+src/dataset/
+  wds/
+    wds_dataset.py       # tar 读取、滑窗、混合管线
+    vla_dataset.py       # VLAWdsDataset / VLALowLevelWdsDataset / UnifiedWdsDataset
+    vlm_dataset.py       # VLMWdsDataset
+  lerobot/
+    lerobot_dataset.py   # LeRobotEpisodeReader：Parquet / metadata / 视频定位
+    vla_dataset.py       # VLALeRobotDataset / VLALowLevelLeRobotDataset / UnifiedLeRobotDataset
+    vlm_dataset.py       # VLMLeRobotDataset：独立 Parquet 图文问答源
+    base_dataset.py      # 两个流共用的 worker / materialize / resume 生命周期
+    stream.py           # 顺序游标与可恢复 shuffle
+    checkpoint.py       # 消费边界状态与 DCP 接入
+    schema.py           # 字段布局与 74D 映射
+    video.py            # RGB / depth 解码与缓存
+  unified_dataset.py    # 两种 backend 共用的 VLA/VLM 包装器
+  data_transforms.py    # 共用变换和 ViewDropoutConfig
+  unified_vla_collator.py
+  qwen3_vl_batching.py
+  normalizer_utils.py
+  sanity_checks.py
+```
+
+公开名称对齐为 `VLAWdsDataset` / `VLALeRobotDataset`、
+`VLALowLevelWdsDataset` / `VLALowLevelLeRobotDataset`、
+`UnifiedWdsDataset` / `UnifiedLeRobotDataset`，以及 `VLMWdsDataset` / `VLMLeRobotDataset`。
+原生 VLM 的字段映射、混合配置见 [LeRobot VLM](lerobot_vlm.md)。现有训练配置名称不变，Python import 和 Hydra
+`_target_` 已更新到对应子包；共享组件保留在父目录。
+
 ## 前一版的问题及修正
 
 | 项目 | 前一版 | 本版 |
@@ -218,8 +249,10 @@ normalizer。metadata 或 signature 不符会明确报错。大体积视频和 P
 
 旧 checkpoint 没有 source/queue 状态，无法无损恢复：`resume_checkpoint_path` 会明确失败，
 不会假装跳过若干 global_step 就恢复了。若只取旧权重开始新数据流，使用现有
-`training.finetune_checkpoint_path`。当前精确恢复限定为普通 in-order、纯 VLA DataLoader，
-不支持 WebLoader 跨 worker 重排或 VLM 混流。
+`training.finetune_checkpoint_path`。当前精确恢复使用普通 in-order DataLoader；支持纯 VLA
+和两条原生 LeRobot 流的固定比例 VLA/VLM 混合。混合 checkpoint 同时保存两条流的队列、
+游标和消费计数，不支持 WebLoader 跨 worker 重排，也不能混入不可恢复的 WDS VLM 流后
+继续声称精确恢复。
 
 ## 与当前 WDS 管线对比
 
@@ -232,7 +265,7 @@ normalizer。metadata 或 signature 不符会明确报错。大体积视频和 P
 | 丢弃 | 先丢锚点索引，再读取/解码窗口 | 已读取 meta/lowdim、组装窗口引用后 keep_ratio 过滤 |
 | shuffle | 解码、变换、增强后入队 | 压缩字节/帧引用入队，出队后解码、变换、增强 |
 | 容量/预热 | 4096 / 4096，第一批之后不再增长 | 16384 / 4096，预热后继续增长 |
-| 多源 | 当前一个 released root，按 split 选 episode | 支持按权重 RandomMix 多个 subset，也可接 VLM |
+| 多源 | VLA 一个 released root，可固定比例混合独立 LeRobot VLM root | 支持按权重 RandomMix 多个 subset，也可接 VLM |
 | DAgger | 不读取 high_quality/is_intervention | 可丢低质量锚点并截断 future/action |
 | 历史、相对动作、归一化、图像变换、collator | 复用原有模型样本处理 | 原处理逻辑 |
 | 深度 | HEVC gray12le + 反量化为米 | npy，uint16 毫米时再转米 |
@@ -267,7 +300,6 @@ torchrun --standalone --nproc_per_node=1 train.py \
   lerobot_root=/share_data/yifan/EgoSteer-RealWorld
 ```
 
-测试：`python -m pytest tests/test_lerobot_stream.py -q`。覆盖真实 H.264/HEVC 视频、独立
-深度分片偏移、74D 重排、指令数量、split 防泄漏、WDS 模型表示对照、val_stride、worker
-划分/序列化及无视频 normalizer。当前环境没有完整 2.9TB 产物；这些是按规范构造的回归测试，
-不冒充全量数据验收或 GPU 训练结果。
+实现已验证 H.264/HEVC 视频、独立深度分片偏移、74D 重排、指令数量、split 隔离、
+WDS 模型表示对照、val_stride、worker 序列化及无视频 normalizer。验证脚本不随仓库发布。
+当前环境没有完整 2.9TB 产物，以上验证不代替全量数据验收或 GPU 训练。

@@ -57,10 +57,10 @@ data:
       pad_mode: repeat
 
 dataset:
-  # Storage-independent interleaving wrapper retains its historical Wds name.
-  _target_: src.dataset.vla_dataset.UnifiedWdsDataset
+  # LeRobot stream using the shared batching contract.
+  _target_: src.dataset.lerobot.vla_dataset.UnifiedLeRobotDataset
   vla_dataset:
-    _target_: src.dataset.lerobot_dataset.VLALeRobotStreamDataset
+    _target_: src.dataset.lerobot.vla_dataset.VLALeRobotDataset
     root: ${lerobot_root}
     split: ${lerobot_train_split}
     val_split: ${lerobot_val_split}
@@ -74,7 +74,7 @@ dataset:
     load_depth: ${training.train_depth}
     load_chest: true
     view_dropout:
-      _target_: src.dataset.vla_dataset.ViewDropoutConfig
+      _target_: src.dataset.data_transforms.ViewDropoutConfig
       drop_head: 0.0
       drop_chest: 0.0
     sanity_checks: ${data.sanity_checks}

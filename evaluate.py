@@ -174,8 +174,8 @@ def main(eval_cfg):
     ) if train_cfg.data.get("depth_clip_range") else None
 
     # ---- 5. Select shards and build dataset ----
-    from src.dataset.wds_dataset import expand_shard_patterns
-    from src.dataset.vla_dataset import VLAWdsDataset
+    from src.dataset.wds.wds_dataset import expand_shard_patterns
+    from src.dataset.wds.vla_dataset import VLAWdsDataset
 
     all_shards = []
     for ds_cfg in eval_cfg.eval_datasets:

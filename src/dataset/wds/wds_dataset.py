@@ -18,7 +18,7 @@ import numpy as np
 import webdataset as wds
 from webdataset.tariterators import base_plus_ext
 
-from .sanity_checks import attach_sample_ctx, build_sample_context
+from ..sanity_checks import attach_sample_ctx, build_sample_context
 
 
 # lowdim.npy layout: base 96D (wrist/hand state+action) + 20D per camera

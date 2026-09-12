@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import pickle
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
@@ -32,7 +33,7 @@ def _json_value(value):
 
 def dataset_fingerprint(dataset, collator_config):
     """Identify metadata and preprocessing; data/video payloads must stay immutable."""
-    description = {
+    description = dataset.resume_description() if hasattr(dataset, "resume_description") else {
         "info": dataset.reader.info,
         "episodes": dataset.reader.episodes,
         "tasks": dataset.reader.tasks,
@@ -45,10 +46,10 @@ def dataset_fingerprint(dataset, collator_config):
         "depth_clip_range": dataset.depth_clip_range,
         "view_dropout": dataset.view_dropout,
         "sanity_checks": dataset.sanity_checks,
-        "collator": collator_config,
     }
+    description["collator"] = collator_config
     digest = hashlib.sha256(json.dumps(_json_value(description), sort_keys=True).encode())
-    if dataset.normalizer is not None:
+    if getattr(dataset, "normalizer", None) is not None:
         for name, tensor in sorted(dataset.normalizer.state_dict().items()):
             digest.update(name.encode())
             digest.update(str((tuple(tensor.shape), tensor.dtype)).encode())
@@ -101,6 +102,11 @@ class StreamCheckpoint:
         if not encoded:
             raise ValueError("LeRobot training batch is missing its stream checkpoint state")
         state = pickle.loads(encoded)
+        worker = self.validate_consumed(state)
+        self.workers[worker] = state
+        self.consumed_batches += 1
+
+    def validate_consumed(self, state):
         nw = max(1, self.spec["num_workers"])
         worker = self.consumed_batches % nw
         if state["worker_id"] != worker:
@@ -108,8 +114,7 @@ class StreamCheckpoint:
         expected = ((self.consumed_batches // nw) + 1) * self.spec["batch_size"]
         if state["delivered"] != expected:
             raise ValueError("stream batch delivery count is inconsistent with consumed batches")
-        self.workers[worker] = state
-        self.consumed_batches += 1
+        return worker
 
     def state_dict(self):
         payload = {
@@ -159,8 +164,9 @@ class StreamCheckpoint:
 class StreamCheckpointCollator:
     """Freeze worker state before the next prefetch can mutate the live queue."""
 
-    def __init__(self, collator):
+    def __init__(self, collator, stream_names=None):
         self.collator = collator
+        self.stream_names = stream_names
 
     def __call__(self, samples):
         states = [getattr(sample, "stream_state", None) for sample in samples]
@@ -168,6 +174,75 @@ class StreamCheckpointCollator:
             raise ValueError("resume collator requires pure resumable LeRobot samples")
         if len({state["worker_id"] for state in states}) != 1:
             raise ValueError("one batch must belong to one stream worker")
+        if self.stream_names is not None:
+            streams = {sample.stream_name: sample.stream_state for sample in samples}
+            if set(streams) != set(self.stream_names):
+                raise ValueError("mixed batch is missing a stream checkpoint")
+            state = {"worker_id": states[-1]["worker_id"], "streams": streams}
+        else:
+            state = states[-1]
         result = self.collator(samples)
-        result[STREAM_STATE_KEY] = pickle.dumps(states[-1], protocol=pickle.HIGHEST_PROTOCOL)
+        result[STREAM_STATE_KEY] = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
         return result
+
+
+class MixedStreamCheckpoint:
+    """Resume fixed-ratio VLA/VLM batches at the joint consumption boundary."""
+
+    def __init__(self, dataset, batch_size, **kwargs):
+        vla_count = math.ceil(batch_size * dataset.vla_ratio)
+        vlm_count = batch_size - vla_count
+        if vla_count < 1 or vlm_count < 1:
+            raise ValueError("mixed training requires at least one VLA and one VLM sample per batch")
+        if dataset.batch_size != batch_size:
+            raise ValueError("mixed dataset batch_size must match the DataLoader")
+        if not hasattr(dataset.vlm_dataset, "resume_enabled"):
+            raise ValueError("mixed resume requires a resumable VLMLeRobotDataset")
+        self.batch_size = int(batch_size)
+        self.vla_ratio = float(dataset.vla_ratio)
+        self.streams = {
+            "vla": StreamCheckpoint(dataset.vla_dataset, batch_size=vla_count, **kwargs),
+            "vlm": StreamCheckpoint(dataset.vlm_dataset, batch_size=vlm_count, **kwargs),
+        }
+
+    @property
+    def consumed_batches(self):
+        counts = {stream.consumed_batches for stream in self.streams.values()}
+        if len(counts) != 1:
+            raise ValueError("VLA/VLM consumption boundaries disagree")
+        return counts.pop()
+
+    @property
+    def rank_key(self):
+        return self.streams["vla"].rank_key
+
+    def record_consumed(self, encoded):
+        if not encoded:
+            raise ValueError("mixed batch has no stream checkpoint state")
+        state = pickle.loads(encoded)
+        if set(state.get("streams", {})) != set(self.streams):
+            raise ValueError("mixed batch must contain VLA and VLM stream states")
+        for name, stream in self.streams.items():
+            if stream.validate_consumed(state["streams"][name]) != state["worker_id"]:
+                raise ValueError("mixed batch contains different logical workers")
+        for name, stream in self.streams.items():
+            stream.record_consumed(pickle.dumps(state["streams"][name]))
+
+    def state_dict(self):
+        payload = {
+            "format": "vla_vlm_v1", "batch_size": self.batch_size, "vla_ratio": self.vla_ratio,
+            "streams": {name: stream.state_dict() for name, stream in self.streams.items()},
+        }
+        return {self.rank_key: pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)}
+
+    def load_state_dict(self, state):
+        payload = pickle.loads(state[self.rank_key])
+        if (payload.get("format") != "vla_vlm_v1" or payload["batch_size"] != self.batch_size
+                or payload["vla_ratio"] != self.vla_ratio):
+            raise ValueError("mixed stream checkpoint format or VLA/VLM ratio mismatch")
+        for name, stream in self.streams.items():
+            stream.load_state_dict(payload["streams"][name])
+        self.consumed_batches  # validate the shared boundary before starting workers
+
+    def require_checkpoint(self, checkpoint_path):
+        self.streams["vla"].require_checkpoint(checkpoint_path)

@@ -60,9 +60,9 @@ data:
       pad_mode: repeat
 
 dataset:
-  _target_: src.dataset.vla_dataset.UnifiedWdsDataset
+  _target_: src.dataset.wds.vla_dataset.UnifiedWdsDataset
   vla_dataset:
-    _target_: src.dataset.vla_dataset.VLAWdsDataset
+    _target_: src.dataset.wds.vla_dataset.VLAWdsDataset
     wds_datasets: ${vla_wds_datasets}
     shape_meta: ${data.shape_meta}
     use_relative_action: True
@@ -84,7 +84,7 @@ dataset:
     # Per-sample training-time view dropout for dual-camera samples.
     # Validation and samples without chest video always keep the available views.
     view_dropout:
-      _target_: src.dataset.vla_dataset.ViewDropoutConfig
+      _target_: src.dataset.data_transforms.ViewDropoutConfig
       drop_head: 0.0
       drop_chest: 0.0
     # Pre-shuffle Bernoulli keep rate (train only). Lower = more shard diversity,

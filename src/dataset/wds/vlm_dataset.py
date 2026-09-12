@@ -10,7 +10,7 @@ import numpy as np
 from src.utils.pytorch_util import dict_apply
 from src.dataset.data_transforms import process_image
 from src.dataset.sanity_checks import DataChecker, MissingOrInvalidFilesError
-from src.dataset.wds_dataset import build_blended_dataset
+from src.dataset.wds.wds_dataset import build_blended_dataset
 
 
 class VLMWdsDataset(torch.utils.data.IterableDataset):

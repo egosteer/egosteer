@@ -7,7 +7,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 
-from .data_transforms import COLOR_AUG
+from ..data_transforms import COLOR_AUG
 
 
 class StreamSample(dict):
@@ -71,7 +71,7 @@ class EpisodeSource:
                 self.episode_pos = self.frame = self.attempted = self.usable = 0
                 self._start_round()
             e = int(self.order[self.episode_pos])
-            length = int(self.dataset.reader.episodes[e]["length"]) - 1
+            length = self.dataset.num_anchors(e)
             if self.frame == length:
                 self.episode_pos += 1
                 self.frame = 0
@@ -156,4 +156,5 @@ class ResumableEpisodeStream:
                 output = StreamSample(output)
                 # The collator freezes this shared state after the last sample.
                 output.stream_state = self.live_state
+                output.stream_name = self.dataset.stream_name
             yield output

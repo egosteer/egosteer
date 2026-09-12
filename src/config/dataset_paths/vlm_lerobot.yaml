@@ -1,0 +1,5 @@
+# @package _global_
+# Independent VLM root: same QA fields as WDS, stored in LeRobot/Parquet.
+vlm_lerobot_root: data_local/lerobot_vlm
+vlm_lerobot_train_split: train
+vlm_lerobot_val_split: val

@@ -26,7 +26,7 @@ def main():
     with hydra.initialize_config_dir(config_dir=str(config.parent.parent), version_base=None):
         cfg = hydra.compose(config_name=f"{config.parent.name}/{config.stem}", overrides=args.overrides)
     data_cfg = OmegaConf.to_container(cfg.dataset.vla_dataset, resolve=True)
-    data_cfg["_target_"] = "src.dataset.lerobot_dataset.VLALowLevelLeRobotDataset"
+    data_cfg["_target_"] = "src.dataset.lerobot.vla_dataset.VLALowLevelLeRobotDataset"
     dataset = hydra.utils.instantiate(data_cfg)
     normalizer, summary = get_normalizer(
         {"batch_size": args.batch_size, "num_workers": args.num_workers, "pin_memory": False},
