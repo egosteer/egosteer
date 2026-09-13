@@ -26,6 +26,7 @@ class LeRobotVLMReader(LeRobotEpisodeReader):
         self.metadata_key = metadata_key
         super().__init__(root, split, **kwargs)
 
+    # Discover image/video columns independently of the VLA motion and calibration schema.
     def _validate_features(self):
         self.fps = float(self.info["fps"])
         if not np.isfinite(self.fps) or self.fps <= 0:
@@ -47,7 +48,9 @@ class LeRobotVLMReader(LeRobotEpisodeReader):
         for key in self.image_keys:
             if key not in features or features[key]["dtype"] not in ("image", "video"):
                 raise ValueError(f"VLM visual feature {key!r} must have dtype image or video")
-        self.video_keys = tuple(key for key in self.image_keys if features[key]["dtype"] == "video")
+        self.video_keys = tuple(
+            key for key in self.image_keys if features[key]["dtype"] == "video"
+        )
         self.image_columns = [key for key in self.image_keys if key not in self.video_keys]
         self.episode_columns = {
             "episode_index",
@@ -63,6 +66,7 @@ class LeRobotVLMReader(LeRobotEpisodeReader):
             ),
         }
 
+    # Accept the official image representation: embedded bytes or a dataset-relative file path.
     def _read_image(self, value):
         """Decode a LeRobot/HF image feature: embedded bytes or root-relative path."""
         if isinstance(value, dict):
@@ -75,6 +79,7 @@ class LeRobotVLMReader(LeRobotEpisodeReader):
                 return image.convert("RGB")
         raise MissingOrInvalidFilesError("VLM image must contain bytes or a path")
 
+    # One Parquet row becomes one QA sample; preserve visual order and defer QA selection until dequeue.
     def read_sample(self, e, k, load_media=True, compressed=False, target_size=None):
         available = self.columns[self.data_paths[e]]
         columns = [self.metadata_key] if self.metadata_key else list(QA_FIELDS)
@@ -82,7 +87,11 @@ class LeRobotVLMReader(LeRobotEpisodeReader):
         if load_media:
             columns += self.image_columns
         row = self.read_table(e, [k], columns).to_pylist()[0]
-        meta = row[self.metadata_key] if self.metadata_key else {key: row[key] for key in QA_FIELDS}
+        meta = (
+            row[self.metadata_key]
+            if self.metadata_key
+            else {key: row[key] for key in QA_FIELDS}
+        )
         if isinstance(meta, str):
             meta = json.loads(meta)
         if not isinstance(meta, dict):
@@ -126,6 +135,7 @@ class VLMLeRobotDataset(LeRobotDataset):
     stream_name = "vlm"
     reader_type = LeRobotVLMReader
 
+    # Reuse the episode stream and resume machinery; weights here score QA candidates, not data sources.
     def __init__(
         self,
         root,
@@ -175,17 +185,24 @@ class VLMLeRobotDataset(LeRobotDataset):
             raise ValueError("VLM training split has no samples")
 
     def __len__(self):
-        return sum(self.num_anchors(e) for e in range(len(self.reader.episodes)))
+        return sum(self.num_anchors(e) for e in range(len(self.episodes)))
 
     def num_anchors(self, e):
         # Unlike VLA, a VLM frame does not require a successor.
-        return int(self.reader.episodes[e]["length"])
+        return int(self.episodes[e]["length"])
 
+    # Route the global episode descriptor to its source; VLM includes the final frame.
     def read_window(self, e, k, load_media=True, compressed=False):
-        return self.reader.read_sample(
-            e, k, load_media=load_media, compressed=compressed, target_size=self.target_image_size
+        source_id, e = self.episode_sources[e]
+        return self.readers[source_id].read_sample(
+            e,
+            k,
+            load_media=load_media,
+            compressed=compressed,
+            target_size=self.target_image_size,
         )
 
+    # Post-shuffle VLM stage: validate candidates, take the highest weighted score, then process images.
     def sample_to_data(self, sample):
         """Validate QA and select/augment after shuffle, as in the WDS pipeline."""
         sample = {**sample, "meta.json": dict(sample["meta.json"])}
@@ -212,7 +229,9 @@ class VLMLeRobotDataset(LeRobotDataset):
         for key in QA_FIELDS[1:]:
             ratings = meta[key]
             if not isinstance(ratings, list) or len(ratings) != len(texts):
-                raise MissingOrInvalidFilesError(f"{key} must have one entry per candidate QA pair")
+                raise MissingOrInvalidFilesError(
+                    f"{key} must have one entry per candidate QA pair"
+                )
             if not all(
                 value is None or (isinstance(value, (int, float)) and np.isfinite(value))
                 for value in ratings
@@ -233,8 +252,6 @@ class VLMLeRobotDataset(LeRobotDataset):
             )
         )
 
-        meta = sample["meta.json"]
-
         image_keys = sorted(
             [k for k in sample.keys() if k.startswith("image_") and k.endswith(".jpg")]
         )
@@ -245,11 +262,11 @@ class VLMLeRobotDataset(LeRobotDataset):
         text = meta["texts"]
         weights = self.weights
 
-        formatting_ratings, visual_dependency_ratings, relevance_ratings = (
-            np.array([r if r is not None else 0 for r in meta[key]]) for key in QA_FIELDS[1:]
-        )
-
         if len(text) > 1:
+            formatting_ratings, visual_dependency_ratings, relevance_ratings = (
+                np.array([r if r is not None else 0 for r in meta[key]])
+                for key in QA_FIELDS[1:]
+            )
             scores = (
                 formatting_ratings * weights[0]
                 + visual_dependency_ratings * weights[1]
@@ -266,7 +283,7 @@ class VLMLeRobotDataset(LeRobotDataset):
         for img_pil in images:
             if img_pil.mode != "RGB":
                 img_pil = img_pil.convert("RGB")
-            raw_images.append(np.array(img_pil, dtype=np.uint8))
+            raw_images.append(np.asarray(img_pil, dtype=np.uint8))
         images_arr = np.stack(raw_images, dtype=np.uint8)
 
         # Always resize: dynamic aspect ratios cause vision-tower recompiles.
@@ -292,6 +309,7 @@ class VLMLeRobotDataset(LeRobotDataset):
         self.checker.check(finite=data)
         return data
 
+    # Include QA scoring and visual selection in the stream compatibility fingerprint.
     def resume_description(self):
         return {
             "kind": "vlm",

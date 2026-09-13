@@ -13,6 +13,7 @@ data:
   tokenizer_padding: max_length
   depth_clip_range: [0.0, 5.0]
   video_base_fps: 30.0
+  dagger_quality_filter: true  # Optional per-frame Parquet high_quality; missing means 1
   sanity_checks:
     rot6d:
       orthogonality_threshold: 0.1
@@ -66,6 +67,7 @@ dataset:
     val_split: ${lerobot_val_split}
     shape_meta: ${data.shape_meta}
     use_relative_action: true
+    dagger_quality_filter: ${data.dagger_quality_filter}
     # Before relative conversion, training action[t] is observation.state[t+1].
     # The native on-disk action column is not used as a training target.
     depth_clip_range: ${data.depth_clip_range}
@@ -87,7 +89,7 @@ dataset:
     resume_warmup_samples: 4096  # Future shuffle selections to predecode on resume
     reader_kwargs:
       row_group_cache_size: 8
-      frame_cache_size: 256  # Resized decoded frames per active video; JPEG windows remain independent
+      frame_cache_size: 183  # Per active video: head + chest RGB cache up to 366 frames
       video_reader_cache_size: 4
   vlm_dataset: null
   vla_ratio: 1

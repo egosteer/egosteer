@@ -26,14 +26,25 @@ from ..unified_vla_collator import ConcatDataCollator
 from ..unified_dataset import UnifiedDataset
 
 
+# Keep causal history intact, including model-executed frames before human intervention.
 def history_indices(k, horizon, stride, mode):
     ids = [k - i * stride for i in range(horizon - 1, -1, -1)]
     return [max(i, 0) for i in ids] if mode == "repeat" else [i for i in ids if i >= 0]
 
 
-def future_indices(k, length, horizon, stride, mode, offset=0):
-    ids = [k + offset + i * stride for i in range(horizon)]
-    return [min(i, length - 1) for i in ids] if mode == "repeat" else [i for i in ids if i < length]
+# Cut supervision at the first low-quality sampled position; episode-tail padding stays separate.
+def future_indices(indices, length, mode, quality=None, quality_offset=0):
+    refs = []
+    for i in indices:
+        if i < length:
+            if quality is not None and quality[i + quality_offset] == 0:
+                break
+            refs.append(i)
+        elif mode == "repeat":
+            refs.append(length - 1)
+        else:
+            break
+    return refs
 
 
 class VLALeRobotDataset(LeRobotDataset):
@@ -46,6 +57,7 @@ class VLALeRobotDataset(LeRobotDataset):
 
     lowdim_only = False
 
+    # Translate shape_meta into window rules shared by reading, padding and model inputs.
     def __init__(
         self,
         root,
@@ -72,6 +84,7 @@ class VLALeRobotDataset(LeRobotDataset):
         val_stride=1,
         sanity_checks=None,
         resume_warmup_samples=4096,
+        dagger_quality_filter=True,
     ):
         super().__init__(
             root,
@@ -105,6 +118,7 @@ class VLALeRobotDataset(LeRobotDataset):
         self.debug_profile_timing = bool(debug_profile_timing)
 
         self.normalizer = None
+        self.dagger_quality_filter = bool(dagger_quality_filter)
 
         # Sampling config from shape_meta.
         self.action_horizon = shape_meta["action"]["horizon"]
@@ -132,7 +146,7 @@ class VLALeRobotDataset(LeRobotDataset):
         self.aug_transform = self.mode == "train"
 
         self._validate_config()
-        if not np.isclose(self.reader.fps, self.video_base_fps):
+        if any(not np.isclose(reader.fps, self.video_base_fps) for reader in self.readers):
             raise ValueError("video_base_fps must match info.json fps")
         if self.mode == "train" and not len(self):
             raise ValueError("training split has no anchors with a next state")
@@ -153,24 +167,60 @@ class VLALeRobotDataset(LeRobotDataset):
 
     def __len__(self):
         """Number of anchors before drop/val_stride; train iteration is infinite."""
-        return sum(self.num_anchors(e) for e in range(len(self.reader.episodes)))
+        return sum(self.num_anchors(e) for e in range(len(self.episodes)))
 
     def num_anchors(self, e):
-        return max(0, int(self.reader.episodes[e]["length"]) - 1)
+        return max(0, int(self.episodes[e]["length"]) - 1)
 
+    # Assemble state history and next-state action targets from one episode.
+    # DAgger checks quality at action time t, while the target value comes from state[t+1].
     def read_window(self, e, k, load_media=True, compressed=False):
         """Build the raw wrist/hand window consumed by sample_to_data."""
-        episode = self.reader.episodes[e]
+        source_id, e = self.episode_sources[e]
+        reader = self.readers[source_id]
+        episode = reader.episodes[e]
         cfg = self.window_config
         length = int(episode["length"])
         if not 0 <= k < length - 1:
             raise IndexError("anchor must have a next state within its episode")
-        state_ids = history_indices(k, cfg.state_horizon, cfg.state_stride, cfg.history_pad_mode)
-        action_ids = future_indices(
-            k, length, cfg.action_horizon, cfg.action_stride, cfg.action_pad_mode, offset=1
+        action_times = range(
+            k + 1, k + 1 + cfg.action_horizon * cfg.action_stride, cfg.action_stride
         )
+        future_times = range(
+            k + cfg.future_frame_stride,
+            k + (cfg.future_frame_horizon + 1) * cfg.future_frame_stride,
+            cfg.future_frame_stride,
+        )
+        quality = None
+        if (
+            self.dagger_quality_filter
+            and "high_quality" in reader.columns[reader.data_paths[e]]
+        ):
+            # Action target state[t+1] uses quality from the preceding row t.
+            indices = sorted(
+                {
+                    k,
+                    *(i - 1 for i in action_times if i < length),
+                    *(i for i in future_times if i < length),
+                }
+            )
+            table = reader.read_table(e, indices, ["high_quality"])
+            flags = np.asarray(table["high_quality"].to_pylist()).reshape(-1)
+            if len(flags) != len(table) or not np.isin(flags, [0, 1]).all():
+                raise ValueError("high_quality must contain 0/1 or boolean values")
+            quality = dict(zip(np.asarray(table["frame_index"]), flags))
+            if quality[k] == 0:
+                return None
+
+        state_ids = history_indices(
+            k, cfg.state_horizon, cfg.state_stride, cfg.history_pad_mode
+        )
+        action_ids = future_indices(
+            action_times, length, cfg.action_pad_mode, quality, quality_offset=-1
+        )
+        future_ids = future_indices(future_times, length, cfg.future_frame_pad_mode, quality)
         # Query measured states once; the future slice supplies next-state targets.
-        wrist, hand = read_motion(self.reader, e, state_ids + action_ids)
+        wrist, hand = read_motion(reader, e, state_ids + action_ids)
         wrist_state, wrist_action = wrist[: len(state_ids)], wrist[len(state_ids) :]
         hand_state, hand_action = hand[: len(state_ids)], hand[len(state_ids) :]
         intrinsic, extrinsic = camera_parameters(episode, "head")
@@ -188,21 +238,16 @@ class VLALeRobotDataset(LeRobotDataset):
             "__key__": f"episode_{episode['episode_index']}_frame_{k}",
         }
         if load_media:
-            self._read_window_media(sample, e, k, compressed)
+            self._read_window_media(sample, reader, e, k, future_ids, compressed)
         return sample
 
-    def _read_window_media(self, sample, e, k, compressed=False):
-        episode = self.reader.episodes[e]
+    # Gather history/future media together; resize and scale intrinsics once before JPEG encoding.
+    def _read_window_media(self, sample, reader, e, k, future_ids, compressed=False):
         cfg = self.window_config
-        image_ids = history_indices(k, cfg.image_horizon, cfg.image_stride, cfg.history_pad_mode)
-        future_ids = future_indices(
-            k,
-            int(episode["length"]),
-            cfg.future_frame_horizon,
-            cfg.future_frame_stride,
-            cfg.future_frame_pad_mode,
-            offset=cfg.future_frame_stride,
+        image_ids = history_indices(
+            k, cfg.image_horizon, cfg.image_stride, cfg.history_pad_mode
         )
+        episode = reader.episodes[e]
         image_refs = [{} for _ in image_ids]
         future_refs = [{} for _ in future_ids]
         for camera in ["head", "chest"] if self.load_chest else ["head"]:
@@ -210,7 +255,7 @@ class VLALeRobotDataset(LeRobotDataset):
             key = f"observation.images.{camera}"
             intrinsic, extrinsic = camera_parameters(episode, camera)
             if compressed and self.target_image_size is not None:
-                height, width = self.reader.info["features"][key]["shape"][:2]
+                height, width = reader.info["features"][key]["shape"][:2]
                 target_h, target_w = self.target_image_size
                 sx, sy = target_w / width, target_h / height
                 intrinsic[0] *= sx
@@ -221,7 +266,7 @@ class VLALeRobotDataset(LeRobotDataset):
             sample[f"{prefix}extrinsic"] = extrinsic
 
             # Read history and future together, writing the final window format directly.
-            images = self.reader.read_media(
+            images = reader.read_media(
                 e,
                 key,
                 image_ids + future_ids,
@@ -236,7 +281,7 @@ class VLALeRobotDataset(LeRobotDataset):
                 if future_ids:
                     sample[f"{prefix}future_frames"] = images[len(image_ids) :]
             if self.load_depth:
-                depth = self.reader.read_media(
+                depth = reader.read_media(
                     e,
                     f"{key}_depth",
                     image_ids,
@@ -258,6 +303,7 @@ class VLALeRobotDataset(LeRobotDataset):
             if future_refs:
                 sample["future_frame_refs"] = future_refs
 
+    # Choose active views after image augmentation, preserving the established RNG order.
     def sample_active_views(self, *, has_chest: bool) -> list[str]:
         """Sample which views are active for the current sample.
 
@@ -355,6 +401,7 @@ class VLALeRobotDataset(LeRobotDataset):
             if not key.startswith("debug_")
         }
 
+    # Check raw motion, apply geometry/normalization, then check the transformed model fields.
     def _process_motion(self, sample, extrinsic, normalizer=None):
         """Check raw motion before geometry, then validate transformed model inputs."""
         motion = {
@@ -384,12 +431,14 @@ class VLALeRobotDataset(LeRobotDataset):
         )
         return state, action
 
+    # Post-shuffle VLA stage: validate, transform, augment, choose instruction and pad supervision.
     def sample_to_data(self, sample):
         """Convert one LeRobot sample into the raw VLA sample schema used by the project.
 
         This is the dataset-side producer contract for `UnifiedVLACollator`.
-        The returned mapping contains visual history, instruction text, intrinsic parameters, padded state/action
-        tensors, action-valid masks, and bookkeeping fields such as `n_states`, `n_actions`, and `is_vla_data`.
+        The returned mapping contains visual history, instruction text, intrinsic
+        parameters, padded state/action tensors, action-valid masks, and bookkeeping
+        fields such as `n_states`, `n_actions`, and `is_vla_data`.
         """
         self.checker.check(
             sample_schema=(
@@ -586,6 +635,7 @@ class VLALowLevelLeRobotDataset(VLALeRobotDataset):
         kwargs.update(mode="val", val_stride=1)
         super().__init__(*args, **kwargs)
 
+    # Normalizer scans use the same motion semantics without image decoding or padded target rows.
     def sample_to_data(self, sample):
         """Extract lowdim fields and compute state/action."""
         self.checker.check(
@@ -631,6 +681,7 @@ class VLALowLevelLeRobotDataset(VLALeRobotDataset):
 class UnifiedLeRobotDataset(UnifiedDataset):
     """Unified LeRobot VLA/VLM stream with joint checkpoint boundaries."""
 
+    # Capture both VLA and VLM cursors at the same consumed-batch boundary.
     def get_collator(self):
         collator = super().get_collator()
         if (

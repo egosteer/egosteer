@@ -6,6 +6,21 @@
 
 ## 字段对应
 
+`vlm_lerobot_root` 同样支持多源配置，例如：
+
+```yaml
+vlm_lerobot_root:
+  - root: /data/vlm_a
+    weight: 3
+  - root: /data/vlm_b
+    weight: 1
+```
+
+多个 VLM 源按权重混合后进入一个共同 shuffle 队列，支持精确 resume。
+源配置中的 `weight` 是选源权重，与下面用于 QA 评分的 `weights` 无关。
+`vla_ratio` 仍单独控制一个 batch 内的 VLA/VLM 数量；VLA、VLM 内部均可各自混合多个源。
+每个源也可指定 `split`、`val_split`，验证按源顺序各遍历一次。其余规则见 `lerobot.md` 的多源说明。
+
 一条原 WDS sample 对应一条 Parquet frame row，多个图片仍属于同一条样本。
 
 | WDS 字段 | LeRobot / Parquet 中的位置 |

@@ -9,6 +9,8 @@
 LeRobot 不导入或继承 src.dataset.wds 中的实现。窗口配置、媒体解码、VLA/VLM
 样本构建及 normalizer 扫描均在 lerobot 子目录内实现。Reader 在初始化时一次读取 schema
 和 row-group 索引，VLM 复用这些 schema 信息，不再为查询列名打开文件。
+缓存按 `(Parquet 文件, row group)` 管理，质量字段与 motion 共享身份列和排序索引；
+后续查询只补读缺少的列，返回时仍投影调用者所需字段。
 本地 LeRobotDataset 负责配置、worker 分配、验证集和 collator；__iter__ 只调用 build_pipeline。
 build_lerobot_pipeline 显式串联读取/组窗、shuffle、媒体解码和 preprocess，结构与 WDS 管线一致。
 视频缓存直接归入 episode reader；source 游标、预热与 shuffle 在同一个管线函数内维护，
@@ -224,9 +226,65 @@ sample_to_data；模型 collator 使用父目录公共组件；验证也走相�
 JPEG 有损，RGB 不再保证与编码前逐像素一致；depth、state/action 不引入 JPEG 误差。
 不做跨窗口媒体共享。底层每路视频保留至多 `frame_cache_size` 个已 resize 的解码帧，最多保留
 `video_reader_cache_size` 路 decoder/缓存上下文；它们不属于 shuffle 队列。
-默认 RGB 训练每路 256×384×384×3=108 MiB，双路约 216 MiB，四路上限约 432 MiB/worker。
+默认 RGB 训练每路 183×384×384×3≈77.2 MiB，双路约 154.4 MiB，四路上限约 308.8 MiB/worker。
+恢复旧 resident 的预热、渐进恢复及按需补读使用独立的视频 decoder/帧缓存，复用同一组
+`frame_cache_size`、`video_reader_cache_size` 配置；metadata 和 Parquet 缓存仍共享。
+恢复期间视频缓存预算最多增加一组，旧 resident 全部恢复后立即释放；退出或异常时也释放。
 启用 depth 时每张 float32 depth 为 576 KiB；原尺寸诊断读取则按原尺寸占用。
 VLM 视频走同一路径；VLM 独立图片也 resize 后编码为 JPEG quality 80。验证与 normalizer 扫描不使用此队列。
+
+### DAgger 帧级过滤
+
+可选 `high_quality` 列与 `observation.state` 等低维字段保存在同一个 Parquet 帧行中。
+支持标量或长度为 1 的 0/1、bool 值：1 表示 human，0 表示 model。
+列不存在时按全 1 处理；列存在但值为空或不是 0/1 时报告数据错误。
+`data.dagger_quality_filter` 默认开启，关闭后不读取该列。
+
+低质量 anchor 不进入队列，但历史 state 和图像仍保留完整时序。
+action 候选时刻为 `t=k+j*action_stride`，用该行的 `high_quality[t]` 判断是否截断，
+监督数值仍为 `state[t+1]`。不能用下一帧的标记替代当前动作来源。
+未来图像检查其实际候选帧 `k+(j+1)*future_stride` 的标记。
+两种监督各自在第一个低质量候选处硬截断，后续 padding/mask 沿用原流程；
+不跳过低质量候选后拼接后面的高质量片段，也不检查 stride 跳过的中间帧。
+episode 末尾继续沿用原有 repeat/truncate 规则，VLA 仍不使用没有下一 state 的末帧 anchor。
+
+过滤发生在窗口读取期间、媒体读取之前，不消耗样本增强 RNG。
+正常过滤不计作读取失败：某轮抽稀后只剩 model anchor 时继续下一轮；
+可跳过的数据错误仍记录日志，整轮只有读取失败时仍报错，硬 I/O/schema 错误立即上报。
+正权重源需能持续提供高质量 anchor；全部为 model 的源不能提供训练样本。
+训练、验证和 normalizer 扫描共用组窗规则；VLM 不使用此列。
+Resume 重新读取旧 resident 时应用相同规则，开关和列的存在情况纳入 fingerprint。
+没有该列的旧数据维持原 fingerprint；有该列的旧 checkpoint 不能静默切换到新的过滤语义。
+
+### 多数据源加权混合
+
+`lerobot_root` 仍支持单个目录，也可以配置多个源：
+
+```yaml
+lerobot_root:
+  - root: /data/demo_a
+    weight: 3
+  - root: /data/demo_b
+    weight: 1
+    split: train
+    val_split: val
+```
+
+每个源的 `weight` 默认是 1，必须非负且总和大于 0；`split` 和 `val_split` 默认继承全局配置。
+每次补入窗口先按归一化权重选源，再推进该源的顺序流，所有源共用一个 16384 容量的
+shuffle 队列和一套出队预处理。3:1 表示长期入队概率为 75%:25%，不保证每个 batch 的配额；
+出队质量过滤也可能改变最终有效样本比例。零权重源不参与训练采样。
+
+各源独立划分 worker、打乱 episode 和推进轮次；每个正权重源都需要足够的有效 episode，
+保证每个训练 worker 有数据。不会把多个源串接成一个按数据量决定比例的流。
+验证及 normalizer 扫描按配置顺序遍历所有源一次（包括零训练权重源），不按权重重采样。
+Normalizer 因此仍按实际扫描数据拟合，不是按训练混合概率重新加权。
+
+Resume 保存选源 RNG、各源游标和共同队列；恢复预热及渐进恢复按描述符返回对应源读取。
+多源 checkpoint 会校验源顺序、路径、归一化权重及 metadata；改变混合配置后不能精确续训。
+原单源配置的样本序列和 checkpoint 格式保持兼容。
+每个源保留自己的 reader 缓存及恢复缓存，容量复用 `reader_kwargs`；增加源数不会增加
+shuffle 容量，但会增加 metadata 和 reader 缓存内存。
 
 ### 主机内存估算（16384 容量）
 
@@ -344,8 +402,8 @@ version 1 在入队前做质量过滤和增强，version 2 使用 zlib，两者�
 | 丢弃 | 先丢锚点索引，再读取/解码窗口 | 已读取 meta/lowdim、组装窗口引用后 keep_ratio 过滤 |
 | shuffle | 视频解码、resize 后 JPEG80/NPY 字节窗口入队；出队后解压、检查、变换、增强 | 压缩字节/帧引用入队，出队后解码、检查、变换、增强 |
 | 容量/预热 | 16384 / 4096，预热后继续增长 | 16384 / 4096，预热后继续增长 |
-| 多源 | VLA 一个 released root，可固定比例混合独立 LeRobot VLM root | 支持按权重 RandomMix 多个 subset，也可接 VLM |
-| DAgger | 不读取 high_quality/is_intervention | 可丢低质量锚点并截断 future/action |
+| 多源 | VLA/VLM 各自支持多个 root 加权混合，共用各自的 shuffle；VLA/VLM 间固定配额 | 支持按权重 RandomMix 多个 subset，也可接 VLM |
+| DAgger | 读取帧行 high_quality，过滤 anchor、截断 action/future；action 按 t 标记监督 state[t+1] | 读取 meta.json 的 high_quality，过滤 anchor、截断 action/future |
 | 历史、相对动作、归一化、图像变换、collator | 本地样本处理；共用公共几何/归一化/图像函数及 collator | 原处理逻辑 |
 | 深度 | HEVC gray12le + 反量化为米 | npy，uint16 毫米时再转米 |
 | 验证抽稀 | worker 窗口流的 val_stride，读取前执行 | worker/subset 窗口流的 val_stride，窗口组成后执行 |
