@@ -18,6 +18,7 @@ dataset:
     target_image_size: ${data.target_image_size}
     shuffle_buffer: 16384
     shuffle_initial: 4096
+    resume_warmup_samples: 4096  # Future shuffle selections to predecode on resume
     drop_ratio: 0.0
     sanity_checks: ${data.sanity_checks}
   # batch_size=8 -> 6 VLA and 2 VLM samples, in this order.

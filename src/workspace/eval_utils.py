@@ -16,7 +16,11 @@ from contextlib import contextmanager
 import pathlib
 
 from src.utils.metric import get_action_accuracy
-from src.utils.fsdp_app_state import APP_STATE_KEY, FSDPWorkspaceAppState
+from src.utils.fsdp_app_state import (
+    APP_STATE_KEY,
+    FSDPWorkspaceAppState,
+    preserve_rng_state,
+)
 
 
 def clear_attn_weights(model):
@@ -80,14 +84,17 @@ def save_checkpoint_native(workspace, rank, path=None, tag='latest'):
     workspace.training_state.update_step = workspace.update_step
     workspace.training_state.global_step = workspace.global_step
     workspace.training_state.epoch = workspace.epoch
-    app_state = FSDPWorkspaceAppState(
-        model=workspace.model,
-        optimizer=workspace.optimizer,
-        lr_scheduler=workspace.lr_scheduler,
-        training_state=workspace.training_state,
-        data_stream=getattr(workspace, "data_stream", None),
-    )
-    dcp.save({APP_STATE_KEY: app_state}, checkpoint_id=str(path))
+    data_stream = getattr(workspace, "data_stream", None)
+    with preserve_rng_state(data_stream is not None) as rng_state:
+        app_state = FSDPWorkspaceAppState(
+            model=workspace.model,
+            optimizer=workspace.optimizer,
+            lr_scheduler=workspace.lr_scheduler,
+            training_state=workspace.training_state,
+            data_stream=data_stream,
+            rng_state=rng_state,
+        )
+        dcp.save({APP_STATE_KEY: app_state}, checkpoint_id=str(path))
     if rank == 0:
         print(f"[ckpt] saved -> {path}")
 

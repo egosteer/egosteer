@@ -84,6 +84,7 @@ dataset:
     # Per-worker WDS media windows: resize, JPEG quality 80 / depth NPY, shuffle.
     shuffle_buffer: 16384
     shuffle_initial: 4096
+    resume_warmup_samples: 4096  # Future shuffle selections to predecode on resume
     reader_kwargs:
       row_group_cache_size: 8
       frame_cache_size: 256  # Resized decoded frames per active video; JPEG windows remain independent

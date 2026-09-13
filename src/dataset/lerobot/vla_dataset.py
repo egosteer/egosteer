@@ -71,6 +71,7 @@ class VLALeRobotDataset(LeRobotDataset):
         view_dropout=ViewDropoutConfig(),
         val_stride=1,
         sanity_checks=None,
+        resume_warmup_samples=4096,
     ):
         super().__init__(
             root,
@@ -81,6 +82,7 @@ class VLALeRobotDataset(LeRobotDataset):
             drop_ratio=drop_ratio,
             shuffle_buffer=shuffle_buffer,
             shuffle_initial=shuffle_initial,
+            resume_warmup_samples=resume_warmup_samples,
             val_stride=val_stride,
             reader_kwargs=reader_kwargs,
             target_image_size=target_image_size,

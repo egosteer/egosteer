@@ -144,6 +144,7 @@ class VLMLeRobotDataset(LeRobotDataset):
         reader_kwargs=None,
         sanity_checks=None,
         return_dataset_info=False,
+        resume_warmup_samples=4096,
     ):
         weights = [0.5, 0.5, 0.5] if weights is None else list(weights)
         if len(weights) != 3 or not np.isfinite(weights).all():
@@ -162,6 +163,7 @@ class VLMLeRobotDataset(LeRobotDataset):
             drop_ratio=drop_ratio,
             shuffle_buffer=shuffle_buffer,
             shuffle_initial=shuffle_initial,
+            resume_warmup_samples=resume_warmup_samples,
             val_stride=val_stride,
             reader_kwargs=reader_kwargs,
             target_image_size=target_image_size,

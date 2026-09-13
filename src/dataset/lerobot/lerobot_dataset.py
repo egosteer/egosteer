@@ -12,7 +12,7 @@ import os
 import pickle
 import random
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
@@ -635,10 +635,34 @@ def build_lerobot_pipeline(dataset, global_worker, total_workers, logical_worker
         rng.bit_generator.state = deepcopy(saved["shuffle_rng"])
     state = {"worker_id": logical_worker, "queue": queue}
     delivered = int(saved["delivered"]) if saved else 0
-    for i in sorted(range(len(queue)), key=lambda i: queue[i][:2]):
-        buffer[i] = read_window(queue[i])
-        if buffer[i] is None:
+
+    def restore_resident(slot):
+        buffer[slot] = read_window(queue[slot])
+        if buffer[slot] is None:
             raise RuntimeError("checkpoint resident is no longer readable; dataset changed")
+
+    needed = set()
+    if queue:
+        # Predict slot choices with a private RNG; new source entries need no warmup.
+        plan_rng = deepcopy(rng)
+        plan_slots = list(range(len(queue)))
+        for _ in range(dataset.resume_warmup_samples):
+            while True:
+                plan_slots.append(None)
+                if len(plan_slots) < dataset.shuffle_buffer:
+                    plan_slots.append(None)
+                if len(plan_slots) >= dataset.shuffle_initial:
+                    break
+            pick = int(plan_rng.integers(len(plan_slots)))
+            if plan_slots[pick] is not None:
+                needed.add(plan_slots[pick])
+            plan_slots[pick] = plan_slots[-1]
+            plan_slots.pop()
+        for token in sorted(needed, key=lambda i: queue[i][:2]):
+            restore_resident(token)
+    deferred = deque(
+        sorted((i for i in range(len(queue)) if i not in needed), key=lambda i: queue[i][:2])
+    )
 
     def source():
         restoring = saved is not None
@@ -687,10 +711,19 @@ def build_lerobot_pipeline(dataset, global_worker, total_workers, logical_worker
         if len(buffer) < dataset.shuffle_initial:
             continue
         pick = int(rng.integers(len(buffer)))
+        if buffer[pick] is None:
+            restore_resident(pick)
         data = preprocess(queue[pick], buffer[pick])
+        # The tail is always a new source window, so remaining old slots never move.
         for items in (queue, buffer):
             items[pick] = items[-1]
             items.pop()
+        # Ordinary DataLoader prefetch overlaps this work with learner computation.
+        while deferred:
+            slot = deferred.popleft()
+            if buffer[slot] is None:
+                restore_resident(slot)
+                break
         if data is None:
             continue
         if dataset.resume_enabled:
@@ -945,6 +978,7 @@ class LeRobotDataset(torch.utils.data.IterableDataset):
         target_image_size,
         sanity_checks,
         return_dataset_info,
+        resume_warmup_samples=4096,
     ):
         super().__init__()
         if (
@@ -953,6 +987,7 @@ class LeRobotDataset(torch.utils.data.IterableDataset):
             or val_stride < 1
             or shuffle_buffer < 1
             or (shuffle_initial is not None and shuffle_initial < 1)
+            or resume_warmup_samples < 0
         ):
             raise ValueError("invalid stream sampling configuration")
         self.root, self.split, self.val_split = str(root), split, val_split
@@ -960,6 +995,7 @@ class LeRobotDataset(torch.utils.data.IterableDataset):
         self.drop_ratio, self.val_stride = float(drop_ratio), int(val_stride)
         self.shuffle_buffer = shuffle_buffer
         self.shuffle_initial = min(shuffle_buffer, shuffle_initial or shuffle_buffer)
+        self.resume_warmup_samples = int(resume_warmup_samples)
         self.target_image_size = tuple(target_image_size) if target_image_size is not None else None
         self.return_dataset_info = return_dataset_info
         self.sanity_checks = dict(sanity_checks or {})

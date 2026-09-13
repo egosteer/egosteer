@@ -43,7 +43,13 @@ from src.utils.distributed_utils import (
     build_mixed_precision_policy,
     init_distributed,
 )
-from src.utils.fsdp_app_state import APP_STATE_KEY, FSDPWorkspaceAppState
+from src.utils.fsdp_app_state import (
+    APP_STATE_KEY,
+    FSDPWorkspaceAppState,
+    capture_rng_state,
+    restore_rng_state,
+    preserve_rng_state,
+)
 from src.utils.profiler_utils import make_profiler_trace_handler
 from src.utils.scheduler_utils import build_lr_scheduler
 from src.utils.training_utils import (
@@ -281,20 +287,30 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                 train_batch_size, collation_fn=dataset.get_collator(),
             )
         else:
+            train_loader_kwargs = dict(cfg.dataloader.loader)
+            if self.data_stream is not None:
+                train_loader_kwargs.setdefault(
+                    "generator", torch.Generator().manual_seed(int(cfg.training.seed) + rank)
+                )
             train_dataloader = DataLoader(
                 dataset=dataset,
                 collate_fn=dataset.get_collator(),
                 worker_init_fn=data_worker_init,
-                **cfg.dataloader.loader,
+                **train_loader_kwargs,
             )
         # Eval is purely local (eval_with_unsharded_model pre-unshards FSDP params),
         # so unequal batch counts across ranks are safe.
         val_dataset = dataset.get_validation_dataset()
+        val_loader_kwargs = dict(cfg.val_dataloader.loader)
+        if self.data_stream is not None:
+            val_loader_kwargs.setdefault(
+                "generator", torch.Generator().manual_seed(int(cfg.training.seed) + rank + 1)
+            )
         val_dataloader = DataLoader(
             dataset=val_dataset,
             collate_fn=val_dataset.get_collator(),
             worker_init_fn=data_worker_init,
-            **cfg.val_dataloader.loader,
+            **val_loader_kwargs,
         )
 
         update_steps_per_epoch = cfg.training.get("steps_per_epoch", 100000)
@@ -374,21 +390,41 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
         )
 
         # Resume BEFORE compile so state_dict keys don't carry the _orig_mod prefix.
+        self._resume_rng_state = None
         if cfg.training.resume_checkpoint_path:
             if rank == 0:
                 print(f"[ckpt] resume: loading full workspace state from {cfg.training.resume_checkpoint_path}")
             # Same as load_checkpoint(): DCP .metadata pickle compat (e.g. Py3.13 pathlib on Py3.10 workers).
             enable_pathlib_local_pickle_compat()
+            rng_state = None
             if self.data_stream is not None:
                 self.data_stream.require_checkpoint(cfg.training.resume_checkpoint_path)
+                keys = dcp.FileSystemReader(
+                    cfg.training.resume_checkpoint_path
+                ).read_metadata().state_dict_metadata
+                rng_prefix = f"{APP_STATE_KEY}.rng_state."
+                rng_keys = {key for key in keys if key.startswith(rng_prefix)}
+                if rng_keys:
+                    expected = {f"{rng_prefix}rank_{r}" for r in range(world_size)}
+                    if not expected.issubset(rng_keys):
+                        raise ValueError(
+                            "checkpoint is missing main-process RNG states for some ranks"
+                        )
+                    rng_state = capture_rng_state()
+                elif rank == 0:
+                    print(
+                        "[ckpt] legacy checkpoint has no main-process RNG state; model/data resume only"
+                    )
             app_state = FSDPWorkspaceAppState(
                 model=self.model,
                 optimizer=self.optimizer,
                 lr_scheduler=self.lr_scheduler,
                 training_state=self.training_state,
                 data_stream=self.data_stream,
+                rng_state=rng_state,
             )
             dcp.load({APP_STATE_KEY: app_state}, checkpoint_id=cfg.training.resume_checkpoint_path)
+            self._resume_rng_state = app_state.rng_state
             self.update_step = self.training_state.update_step
             self.global_step = self.training_state.global_step
             self.epoch = self.training_state.epoch
@@ -511,7 +547,8 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
             save_interval_ckpt(self, rank)
 
         if step_log is not None and rank == 0:
-            wandb.log(step_log, step=self.update_step)
+            with preserve_rng_state(getattr(self, "data_stream", None) is not None):
+                wandb.log(step_log, step=self.update_step)
         return step_log
 
     def train_loop(self, cfg, ctx, profiler, train_dataloader, val_dataloader, micro_batches_per_epoch, topk_manager):
@@ -563,6 +600,9 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
                     stream_state = (
                         batch.pop("_stream_state", None) if data_stream is not None else None
                     )
+                    if data_stream is not None and self._resume_rng_state is not None:
+                        restore_rng_state(self._resume_rng_state)
+                        self._resume_rng_state = None
                     sync_gradients, step_skipped, raw_loss, part_grad_norms = self.train_step(
                         batch, batch_idx, grad_accum_steps, cfg, rank,
                     )

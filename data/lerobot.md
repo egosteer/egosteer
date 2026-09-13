@@ -256,7 +256,9 @@ VLA/VLM 混合时，两条流各有 16384 容量，不按 6:2 比例缩减容量
 
 ## Checkpoint / resume
 
-现有 DCP checkpoint 现在同时保存模型、optimizer、scheduler、training_state 和数据流状态。
+LeRobot 的 DCP checkpoint 同时保存模型、optimizer、scheduler、training_state、数据流状态
+及各 rank 的训练主进程 RNG。RNG 使用独立的 app.rng_state.rank_<rank> bytes 键，
+包含 Python、NumPy、Torch CPU 和当前已初始化 CUDA 设备的状态；不会初始化其他 CUDA 设备。
 单流和固定配比 VLA/VLM 混合流共用一个 StreamCheckpoint；消费计数、worker 校验与
 保存/恢复只实现一套。磁盘上仍兼容原有的单流及 vla_vlm_v1 混合包装格式。
 数据流使用独立的 `app.data_stream.rank_<rank>` 键，不让多个 rank 的 bytes 叶子被当作同一份
@@ -287,13 +289,26 @@ collator 在一个 batch 组装完后将状态序列化为不可变 bytes；训�
 3. 新 DataLoader 的物理 worker 0 映射到 `consumed_batches % num_workers` 对应的逻辑 worker，
    其他 worker 同样轮转；未曾交付过 batch 的 worker 从初始状态开始。
 4. 从保存的 source cursor 和 RNG 直接继续，不从头重放全部历史索引。
-5. 按 episode/anchor 排序读取 resident 描述符，通过与新 source 相同的解码→resize→JPEG80/NPY 编码路径重建独立压缩窗口，
-   放回原队列槽位。排序只影响读取顺序，不改变出队顺序或 source/RNG；不重新随机预热，
-   也不把图像或压缩媒体载荷存进 checkpoint。队列重建完成后才继续推进 source。
+5. 复制 shuffle RNG 和队列槽位，预测未来 resume_warmup_samples 次选择（默认 4096），
+   只预先读取这些选择会用到的旧 resident，按 episode/anchor 顺序准备 JPEG80/NPY 窗口。
+   预测包含将来补入的新 source 占位，不推进真实 source 或 RNG；预热旧窗口数不一定是 4096。
+   恢复后继续正常补入新 source，每次抽样后额外准备至多一个剩余旧 resident；若抽中未准备的
+   旧窗口则现场读取。以上工作由普通 DataLoader workers/预取执行，没有新增后台解码线程。
+   每次抽样前必补入新窗口，因此 swap-pop 的尾部总是新 source，尚未消费的旧槽位不会移动。
+   中途再次保存仍只保存逻辑描述符/游标/RNG，不保存解码进度或媒体载荷。
 6. 每条 sample 的 Python、NumPy、Torch CPU 和 Albumentations 随机源都由描述符 seed
    控制，全部在出队后执行，因此指令选择、颜色增强、depth 增强、view dropout 可复现。
 7. 训练循环保留跨逻辑 epoch 的同一个数据 iterator；根据已消费 microbatch 数恢复 epoch
    和 batch offset，并在边界之前限流，避免多取、丢弃一个 batch。
+8. 主进程 RNG 在加载时暂存，在模型 setup/compile、DataLoader 启动和首个 batch 读取之后，
+   紧接第一次 train_step 前恢复一次。LeRobot 的 DataLoader 使用独立 Torch generator，
+   checkpoint I/O 和 wandb.log 保持主进程 RNG 不变，避免额外消耗影响后续训练抽样。
+
+resume_warmup_samples 只影响恢复调度，不加入数据流 signature；允许设为 0 或修改大小，
+不改变样本、instruction、shuffle 顺序。VLA/VLM 混合时每个 worker 的两条流分别执行预测。
+旧 JPEG checkpoint 没有主进程 RNG 键时，继续恢复模型和数据流并打印提示，不能补造旧 RNG。
+若 RNG 键已存在但缺少当前拓扑中的某个 rank，则拒绝不完整恢复。WDS 路径保持原 checkpoint
+和 RNG 行为，仅 LeRobot 开启这套主进程 RNG 保存/恢复。
 
 使用方式仍是原训练参数：
 
@@ -306,7 +321,8 @@ torchrun --standalone --nproc_per_node=1 train.py \
 要求相同 batch size、worker 数、world size、梯度累积、epoch 长度、采样/处理配置和
 normalizer。metadata 或 signature 不符会明确报错。大体积视频和 Parquet 内容不做全量哈希，
 需要保持原始文件不可变；精确样本恢复也要求相同代码和依赖版本。profiling 时间和日志计数
-不属于复现目标。本功能恢复数据输入，不额外承诺 CUDA 随机训练轨迹逐 bit 一致。
+不属于复现目标。主进程 RNG 恢复覆盖上述默认随机源，不等同于保证非确定性 CUDA kernel、
+不同软件版本或自定义 generator 的逐 bit 训练复现。CPU 随机训练续跑已验证，CUDA 实机验证未运行。
 
 媒体队列使用 stream spec version 3，并记录 JPEG quality 80 / depth NPY 编码配置；
 version 1 在入队前做质量过滤和增强，version 2 使用 zlib，两者均不接受精确数据恢复，

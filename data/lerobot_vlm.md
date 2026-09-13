@@ -102,3 +102,6 @@ normalizer 仍仅由 VLA train 数据拟合；VLM 不使用另一套机器人 no
 VLM 图像/视频先 resize 到 target_image_size，训练队列保存 resize 后的独立 JPEG quality 80 字节；QA 内容检查、评分选择和随机图像增强在出队后执行，
 与 WDS 的 preprocess 时机一致。resume 使用 version 3 描述符重建同样的压缩队列，
 恢复槽位和随机 seed 后继续消费；不保存图像载荷。
+
+VLM 同样支持 resume_warmup_samples（默认 4096）预测预热和逐窗口渐进恢复；
+QA 选择规则不变，图像增强仍由保存的样本 seed 控制。
