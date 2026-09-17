@@ -44,6 +44,8 @@ its episode metadata. A file may contain multiple episodes.
 | `episode_index` | `int64` | Episode identifier. |
 | `index` | `int64` | Global frame index: `dataset_from_index + frame_index`. |
 | `task_index` | `int64` | Task identifier in `meta/tasks.parquet`. |
+| `observation.camera.head_world2cam` | `float32 [16]` | Current frame's world-to-head-camera transform, row-major flattened 4×4. |
+| `observation.camera.chest_world2cam` | `float32 [16]` | Current frame's world-to-chest-camera transform; read when chest loading is enabled. |
 | `high_quality` | optional, default `1` | DAgger flag: `1` = human-intervention frame, `0` = model-execution frame. Scalar or single-element 0/1 or boolean values. |
 
 Training uses **`action[t] = observation.state[t+1]`** before coordinate
@@ -83,8 +85,6 @@ Matrices are stored as row-major flattened arrays.
 | `dataset_from_index` / `dataset_to_index` | `int64` | Global frame interval `[from, to)`; its length equals `length`. |
 | `data/chunk_index` / `data/file_index` | `int64` | Location of the episode's Parquet frame rows. |
 | `calibration.head_intrinsics` / `calibration.chest_intrinsics` | `float64 [9]` | Camera intrinsic matrix, flattened 3×3. |
-| `calibration.head_world2cam` | `float64 [16]` | World-to-head-camera transform. Must be the identity matrix. |
-| `calibration.chest_world2cam` | `float64 [16]` | World-to-chest-camera transform, flattened 4×4. |
 | `calibration.{camera}_cam_to_{side}_base` | `float64 [16]` | Camera-to-arm-base transform for each combination of `camera` = `head`, `chest` and `side` = `left`, `right`. |
 | `videos/{feature}/chunk_index` / `file_index` | `int64` | Video location for each camera feature listed below. |
 | `videos/{feature}/from_timestamp` / `to_timestamp` | `float64` | Episode interval in that video file, in seconds. Its duration equals `length / fps`. |
@@ -144,11 +144,16 @@ Prepare a LeRobot v3 dataset with the fields above.
   <img src="../assets/wrist-coordinate.png" width="70%">
 </p>
 
-Wrist poses and fingertips are in the **world frame**, defined as the head
-camera frame. The red, green, and blue axes in the figure correspond to x, y,
-and z. Camera extrinsics transform world coordinates into camera coordinates;
+Wrist poses and fingertips are in a shared **world frame**. The red, green,
+and blue axes in the figure correspond to x, y, and z. Frame-level camera
+extrinsics transform world coordinates into each frame's camera coordinates;
 homogeneous transforms act on column vectors. See
 [EgoSmith](https://github.com/egosteer/egosmith) for the coordinate convention.
+
+Each window uses its anchor frame's camera pose. Future-frame supervision uses
+the poses from the corresponding future rows, including repeated tail frames.
+Single-camera loading reads head poses only; dual-camera loading reads both.
+World-to-camera transforms are read from frame rows, not episode metadata.
 
 **Validation skips and logs bad samples**
 

@@ -36,7 +36,6 @@ from ..unified_vla_collator import UnifiedVLACollator
 
 CALIBRATION_SHAPES = {
     **{f"calibration.{cam}_intrinsics": (3, 3) for cam in ("head", "chest")},
-    **{f"calibration.{cam}_world2cam": (4, 4) for cam in ("head", "chest")},
     **{
         f"calibration.{cam}_cam_to_{side}_base": (4, 4)
         for cam in ("head", "chest")
@@ -66,15 +65,22 @@ EPISODE_COLUMNS = {
 }
 
 
-# Adapt episode calibration to the intrinsic4/extrinsic16 model fields.
-def camera_parameters(episode, camera):
-    """Return float32 intrinsic4 and flattened world-to-camera extrinsic16."""
-    intrinsic = episode[f"calibration.{camera}_intrinsics"]
-    extrinsic = episode[f"calibration.{camera}_world2cam"]
-    return (
-        intrinsic[[0, 1, 0, 1], [0, 1, 2, 2]].astype(np.float32),
-        extrinsic.reshape(16).astype(np.float32),
-    )
+# Read current/future camera poses together, preserving padding and requested order.
+def camera_parameters(reader, e, indices, cameras):
+    """Return episode intrinsics and frame-level world-to-camera poses per active camera."""
+    columns = [f"observation.camera.{camera}_world2cam" for camera in cameras]
+    table = reader.read_table(e, indices, columns)
+    frames = np.asarray(table["frame_index"])
+    order = np.argsort(frames)
+    positions = order[np.searchsorted(frames[order], indices)]
+    result = {}
+    for camera, column in zip(cameras, columns):
+        intrinsic = reader.episodes[e][f"calibration.{camera}_intrinsics"]
+        poses = np.stack(table[column].to_numpy()[positions]).astype(np.float32, copy=False)
+        if poses.shape != (len(indices), 16):
+            raise ValueError(f"{column} must contain flattened 4x4 matrices")
+        result[camera] = intrinsic[[0, 1, 0, 1], [0, 1, 2, 2]].astype(np.float32), poses
+    return result
 
 
 # Read history and next-state targets together, preserving requested frame order.
@@ -343,8 +349,6 @@ class LeRobotEpisodeReader:
                 if self.is_vla:
                     for field, shape in CALIBRATION_SHAPES.items():
                         row[field] = np.asarray(row[field], dtype=np.float64).reshape(shape)
-                    if not np.allclose(row["calibration.head_world2cam"], np.eye(4), atol=1e-6):
-                        raise ValueError(f"episode {eid}: head_world2cam must be identity")
                 for key in self.video_keys:
                     prefix = f"videos/{key}"
                     if not self.is_vla and row.get(f"{prefix}/file_index") is None:
@@ -891,6 +895,7 @@ def dataset_fingerprint(dataset, collator_config):
             "use_relative_action": dataset.use_relative_action,
             "load_depth": dataset.load_depth,
             "load_chest": dataset.load_chest,
+            "camera_extrinsics": "frame_world2cam_v1",
             "target_image_size": dataset.target_image_size,
             "depth_clip_range": dataset.depth_clip_range,
             "view_dropout": dataset.view_dropout,

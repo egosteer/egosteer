@@ -223,20 +223,27 @@ class VLALeRobotDataset(LeRobotDataset):
         wrist, hand = read_motion(reader, e, state_ids + action_ids)
         wrist_state, wrist_action = wrist[: len(state_ids)], wrist[len(state_ids) :]
         hand_state, hand_action = hand[: len(state_ids)], hand[len(state_ids) :]
-        intrinsic, extrinsic = camera_parameters(episode, "head")
         sample = {
             "wrist_state": wrist_state,
             "hand_state": hand_state,
             "wrist_action": wrist_action,
             "hand_action": hand_action,
-            "extrinsic": extrinsic,
-            "intrinsic": intrinsic,
             "instruction": list(episode["instructions"]),
             "instruction_num": len(episode["instructions"]),
             "dataset_name": episode["tasks"][0],
             "episode_index": int(episode["episode_index"]),
             "__key__": f"episode_{episode['episode_index']}_frame_{k}",
         }
+        cameras = ["head", "chest"] if self.load_chest else ["head"]
+        camera_ids = [k] + future_ids if load_media else [k]
+        for camera, (intrinsic, poses) in camera_parameters(
+            reader, e, camera_ids, cameras
+        ).items():
+            prefix = "" if camera == "head" else "chest_"
+            sample[f"{prefix}intrinsic"] = intrinsic
+            sample[f"{prefix}extrinsic"] = poses[0]
+            if load_media and future_ids:
+                sample[f"future_{camera}_extrinsic"] = poses[1:]
         if load_media:
             self._read_window_media(sample, reader, e, k, future_ids, compressed)
         return sample
@@ -247,13 +254,12 @@ class VLALeRobotDataset(LeRobotDataset):
         image_ids = history_indices(
             k, cfg.image_horizon, cfg.image_stride, cfg.history_pad_mode
         )
-        episode = reader.episodes[e]
         image_refs = [{} for _ in image_ids]
         future_refs = [{} for _ in future_ids]
         for camera in ["head", "chest"] if self.load_chest else ["head"]:
             prefix = "" if camera == "head" else "chest_"
             key = f"observation.images.{camera}"
-            intrinsic, extrinsic = camera_parameters(episode, camera)
+            intrinsic = sample[f"{prefix}intrinsic"]
             if compressed and self.target_image_size is not None:
                 height, width = reader.info["features"][key]["shape"][:2]
                 target_h, target_w = self.target_image_size
@@ -263,7 +269,6 @@ class VLALeRobotDataset(LeRobotDataset):
                 intrinsic[2] *= sx
                 intrinsic[3] *= sy
             sample[f"{prefix}intrinsic"] = intrinsic
-            sample[f"{prefix}extrinsic"] = extrinsic
 
             # Read history and future together, writing the final window format directly.
             images = reader.read_media(
@@ -293,10 +298,6 @@ class VLALeRobotDataset(LeRobotDataset):
                         ref[f"{prefix}depth.npy"] = frame
                 else:
                     sample[f"{prefix}depth"] = depth
-            if future_ids:
-                sample[f"future_{camera}_extrinsic"] = np.repeat(
-                    extrinsic[None], len(future_ids), axis=0
-                )
 
         if compressed:
             sample["image_frame_refs"] = image_refs
