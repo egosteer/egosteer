@@ -40,6 +40,7 @@ import pyarrow.parquet as pq
 from PIL import Image
 
 HEAD, CHEST = "observation.images.head", "observation.images.chest"
+WORLD2CAM = {"head": "observation.camera.head_world2cam", "chest": "observation.camera.chest_world2cam"}
 
 
 # ----------------------------------------------------------------------------- reading LeRobot
@@ -48,7 +49,7 @@ def load_episodes(root):
     """One dict per episode from meta/episodes/*.parquet, sorted by episode_index."""
     wanted = ["episode_index", "tasks", "length", "split", "instructions",
               "data/chunk_index", "data/file_index",
-              "calibration/head_intrinsics", "calibration/chest_intrinsics", "calibration/chest_world2cam"]
+              "calibration/head_intrinsics", "calibration/chest_intrinsics"]
     for cam in (HEAD, CHEST):
         wanted += [f"videos/{cam}/chunk_index", f"videos/{cam}/file_index",
                    f"videos/{cam}/from_timestamp", f"videos/{cam}/to_timestamp"]
@@ -59,7 +60,7 @@ def load_episodes(root):
 
 
 def read_lowdim_rows(root, info, ep):
-    """(state, action) float32 arrays for one episode.
+    """(state, action, head_world2cam, chest_world2cam) float32 arrays for one episode.
 
     The dataset writes one parquet row group per episode, so only that row
     group is read instead of the whole file.
@@ -69,15 +70,14 @@ def read_lowdim_rows(root, info, ep):
     for rg in range(pf.num_row_groups):
         first = pf.read_row_group(rg, columns=["episode_index"]).column(0)[0].as_py()
         if first == ep["episode_index"]:
-            table = pf.read_row_group(rg, columns=["episode_index", "observation.state", "action"])
+            table = pf.read_row_group(rg, columns=["episode_index", "observation.state", "action", *WORLD2CAM.values()])
             break
     else:
         raise KeyError(f"episode {ep['episode_index']} not found in {path}")
     assert set(table.column("episode_index").to_pylist()) == {ep["episode_index"]}, "row group holds more than one episode"
-    state = np.asarray(table.column("observation.state").to_pylist(), dtype=np.float32)
-    action = np.asarray(table.column("action").to_pylist(), dtype=np.float32)
-    assert len(state) == ep["length"], f"episode {ep['episode_index']}: {len(state)} rows, expected {ep['length']}"
-    return state, action
+    columns = [np.asarray(table.column(c).to_pylist(), dtype=np.float32) for c in ("observation.state", "action", *WORLD2CAM.values())]
+    assert len(columns[0]) == ep["length"], f"episode {ep['episode_index']}: {len(columns[0])} rows, expected {ep['length']}"
+    return columns
 
 
 def decode_video(root, info, ep, cam):
@@ -104,13 +104,14 @@ def decode_video(root, info, ep, cam):
 
 # ----------------------------------------------------------------------------- sample encoding
 
-def to_lowdim(state, action, head_K, chest_K, chest_world2cam):
+def to_lowdim(state, action, head_world2cam, chest_world2cam, head_K, chest_K):
     """Map one frame of the 74-dim LeRobot state/action to the 136-dim lowdim vector.
 
     LeRobot layout: [arm_L(7) arm_R(7) hand_L(6) hand_R(6) wrist_L(9) wrist_R(9) tips_L(15) tips_R(15)]
     where wrist = [xyz(3) rot6d(6)] in the head-camera (world) frame.
     lowdim layout: wrist_state(18) hand_state(30) wrist_action(18) hand_action(30)
                    head_extrinsic(16) head_intrinsic(4) chest_extrinsic(16) chest_intrinsic(4)
+    The extrinsics are the frame's world2cam matrices (4x4, row-major) as stored in the dataset.
     """
     def wrist(v):
         return np.concatenate([v[26:29], v[35:38], v[29:35], v[38:44]])   # L xyz, R xyz, L rot6d, R rot6d
@@ -118,10 +119,8 @@ def to_lowdim(state, action, head_K, chest_K, chest_world2cam):
     def intrinsic(K):   # K is a row-major 3x3 -> [fx, fy, cx, cy]
         return [K[0], K[4], K[2], K[5]]
 
-    head_extrinsic = np.eye(4).reshape(-1)          # world frame == head camera frame
     return np.concatenate([wrist(state), state[44:74], wrist(action), action[44:74],
-                           head_extrinsic, intrinsic(head_K),
-                           np.asarray(chest_world2cam).reshape(-1), intrinsic(chest_K)]).astype(np.float32)
+                           head_world2cam, intrinsic(head_K), chest_world2cam, intrinsic(chest_K)]).astype(np.float32)
 
 
 def jpeg_bytes(rgb, quality):
@@ -170,7 +169,7 @@ def write_shard(job):
             tar.addfile(member, io.BytesIO(data))
 
         for ep in episodes:
-            state, action = read_lowdim_rows(root, info, ep)
+            state, action, head_world2cam, chest_world2cam = read_lowdim_rows(root, info, ep)
             meta = {"instruction": list(ep["instructions"]), "instruction_num": len(ep["instructions"]),
                     "episode_index": ep["episode_index"], "dataset_name": ep["tasks"][0], "cameras": ["head", "chest"]}
             meta_json = json.dumps(meta, ensure_ascii=False).encode("utf-8")
@@ -180,8 +179,8 @@ def write_shard(job):
                 key = f"episode_{ep['episode_index']:06d}_frame_{t:06d}"
                 add(key + ".image.jpg", jpeg_bytes(head, quality))
                 add(key + ".chest_image.jpg", jpeg_bytes(chest, quality))
-                add(key + ".lowdim.npy", npy_bytes(to_lowdim(state[t], action[t], ep["calibration/head_intrinsics"],
-                                                              ep["calibration/chest_intrinsics"], ep["calibration/chest_world2cam"])))
+                add(key + ".lowdim.npy", npy_bytes(to_lowdim(state[t], action[t], head_world2cam[t], chest_world2cam[t],
+                                                              ep["calibration/head_intrinsics"], ep["calibration/chest_intrinsics"])))
                 add(key + ".meta.json", meta_json)
                 decoded += 1
             assert decoded == ep["length"], f"episode {ep['episode_index']}: decoded {decoded} frames, expected {ep['length']}"

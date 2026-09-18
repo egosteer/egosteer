@@ -114,8 +114,9 @@ python scripts/verify_wds.py    --wds  /path/EgoSteer-RealWorld.wds --root /path
   `--frames-per-shard` frames (default 1000, i.e. 2–4 episodes per shard), so every shard mixes tasks and
   no episode is split. `<out>/<split>/index.json` records which episodes went into each shard.
 - Splits follow the dataset's `split` column: `<out>/train/` and `<out>/val/`.
-- Each frame gets `image.jpg`, `chest_image.jpg`, `lowdim.npy` (136 dims, head + chest) and `meta.json`
-  with all of the episode's instructions; depth is not exported.
+- Each frame gets `image.jpg`, `chest_image.jpg`, `lowdim.npy` (136 dims, head + chest; the extrinsic blocks
+  are the dataset's frame-level `observation.camera.{head,chest}_world2cam`) and `meta.json` with all of the
+  episode's instructions; depth is not exported.
 - Re-running skips shards that already exist, so an interrupted run resumes where it stopped (the script refuses
   to resume into an output directory that was written with different arguments). To spread one conversion over
   several machines that share the output directory, give each machine a different `--part k/N`. `--workers`
