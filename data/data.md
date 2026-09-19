@@ -95,7 +95,7 @@ Add a `chest_image.jpg` member; append the chest
 
 **Changing the image resolution**
 
-To change the image resolution, set `data.target_image_size` in [unified_wds.yaml](../src/config/data/unified_wds.yaml) to the desired `[W, H]`, or `null` to keep the original resolution. A higher resolution means more vision patches per image, so it raises the per-sample token count just as an extra camera would. After changing it, adjust `data.max_vlm_tokens` and `dataloader.loader.batch_size` to match.
+To change the image resolution, set `data.target_image_size` in [unified_wds.yaml](../src/config/data/unified_wds.yaml) to the desired `[H, W]`, or `null` to keep the original resolution. A higher resolution means more vision patches per image, so it raises the per-sample token count just as an extra camera would. After changing it, adjust `data.max_vlm_tokens` and `dataloader.loader.batch_size` to match.
 
 ---
 

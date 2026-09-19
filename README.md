@@ -78,7 +78,7 @@ We also release the trained EgoSteer models below. Use **EgoSteer-3B-Base** as t
 | Model Type | Model Name | Parameters | Description |
 |------------|------------|------------|-------------|
 | **EgoSteer Pretrained** | [EgoSteer-3B-Base](https://huggingface.co/EgoSteer/EgoSteer-3B-Base) | 3B | Base EgoSteer model trained on 9.6k hours of egocentric human videos, ready for fine-tuning |
-| **EgoSteer Generalist** | [EgoSteer-3B-RealMan](https://huggingface.co/EgoSteer/EgoSteer-3B-RealMan) | 3B | A generalist model post-trained on real-world data collected on the RealMan robot |
+| **EgoSteer Generalist** | [EgoSteer-3B-RealMan](https://huggingface.co/EgoSteer/EgoSteer-3B-RealMan) | 3B | A generalist model post-trained on [real-world data collected on the RealMan robot](https://huggingface.co/datasets/EgoSteer/EgoSteer-RealWorld) |
 
 ## Quick Start
 

@@ -342,6 +342,13 @@ def render_overlay_image(vis_sample, action_stride=4):
 
     step_valid = vis_sample["step_valid"]  # [T] boolean
     total_steps = pred_wrist.shape[0]
+
+    # Color gradients (BGR): cross-hue for maximum contrast between t=0 and t=T
+    GT_COLOR_START = (255, 100, 0)      # bright blue
+    GT_COLOR_END = (200, 255, 0)        # cyan
+    PRED_COLOR_START = (50, 50, 255)    # bright red
+    PRED_COLOR_END = (0, 220, 255)      # yellow
+
     # Only select valid (non-padded) timesteps at the given stride
     valid_steps = [t for t in range(total_steps) if step_valid[t]]
     if not valid_steps:
@@ -353,12 +360,6 @@ def render_overlay_image(vis_sample, action_stride=4):
     if valid_steps[-1] not in timesteps:
         timesteps.append(valid_steps[-1])
     num_valid = len(valid_steps)
-
-    # Color gradients (BGR): cross-hue for maximum contrast between t=0 and t=T
-    GT_COLOR_START = (255, 100, 0)      # bright blue
-    GT_COLOR_END = (200, 255, 0)        # cyan
-    PRED_COLOR_START = (50, 50, 255)    # bright red
-    PRED_COLOR_END = (0, 220, 255)      # yellow
 
     # Draw trajectory lines first (thinner, behind points)
     max_valid_t = valid_steps[-1]
