@@ -245,8 +245,11 @@ training:
   resume_checkpoint_path: /path/to/checkpoint        # a DCP checkpoint directory
 ```
 
-Unlike fine-tuning, resuming restores the full training state, namely the model,
-optimizer, LR schedule, and step counter, so the run continues exactly where it stopped.
+Unlike fine-tuning, resuming restores the model, optimizer, LR schedule, and
+step counter. With LeRobot datasets it additionally restores the data stream
+position and RNG state, so the run continues exactly where it stopped. The WDS
+stream cannot restore its position: resuming a WDS run reloads the training
+state above but restarts data loading from a fresh shuffle.
 
 ### Checkpoint Layout
 
