@@ -101,6 +101,36 @@ To change the image resolution, set `data.target_image_size` in [unified_wds.yam
 
 ---
 
+## Converting the EgoSteer LeRobot release
+
+The public EgoSteer real-robot dataset is released in [LeRobot v3](https://github.com/huggingface/lerobot)
+format. `scripts/lerobot_to_wds.py` converts it into the WebDataset shards above:
+
+```bash
+pip install av pyarrow          # in addition to requirements.txt
+python scripts/lerobot_to_wds.py --root /path/EgoSteer-RealWorld --out /path/EgoSteer-RealWorld.wds --workers 32
+python scripts/verify_wds.py    --wds  /path/EgoSteer-RealWorld.wds --root /path/EgoSteer-RealWorld
+```
+
+- Episodes are shuffled with `--seed` (default 0) and packed **whole** into shards of about
+  `--frames-per-shard` frames (default 1000, i.e. 2–4 episodes per shard), so every shard mixes tasks and
+  no episode is split. `<out>/<split>/index.json` records which episodes went into each shard.
+- Splits follow the dataset's `split` column: `<out>/train/` and `<out>/val/`.
+- Each frame gets `image.jpg`, `chest_image.jpg`, `lowdim.npy` (136 dims, head + chest; the extrinsic blocks
+  are the dataset's frame-level `observation.camera.{head,chest}_world2cam`) and `meta.json` with all of the
+  episode's instructions; depth is not exported.
+- Re-running skips shards that already exist, so an interrupted run resumes where it stopped (the script refuses
+  to resume into an output directory that was written with different arguments). To spread one conversion over
+  several machines that share the output directory, give each machine a different `--part k/N`. `--workers`
+  defaults to the machine's CPU count.
+- `verify_wds.py` checks the contract above (member order, per-episode contiguity, no episode in two
+  shards, `instruction_num`, lowdim shape) and, with `--root`, frame counts against the LeRobot dataset.
+
+Then point `wds_base_dir` in [vla_wds.yaml](../src/config/dataset_paths/vla_wds.yaml) at `<out>` and
+compute the normalizer as below.
+
+---
+
 ## Normalizer
 
 Training requires a precomputed state/action normalizer. The example package ships none, so compute it after unpacking the shards:

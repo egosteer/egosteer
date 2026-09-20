@@ -1,7 +1,7 @@
 """WebSocket smoke-test client.
 
 Sends randomized observations (480x640 dual-camera by default) and prints
-server inference latency. Wire format matches the production client; pass
+server inference latency. Wire format matches the robot-side client; pass
 ``--image-format jpeg`` to test the compressed transport path.
 """
 from __future__ import annotations
@@ -126,7 +126,7 @@ def _parse_args() -> argparse.Namespace:
                    help=f"action_rtc length (1..{ACTION_HORIZON}); 0 disables RTC.")
     p.add_argument("--image-format", choices=["raw", "jpeg"], default="raw",
                    help="jpeg: per-frame JPEG encode + dict wire format "
-                        "(compatible with EgoSteer-Inference production client).")
+                        "(same format as the robot-side client).")
     p.add_argument("--jpeg-quality", type=int, default=80)
     p.add_argument("--instruction", default="grasp the yellow toy")
     return p.parse_args()

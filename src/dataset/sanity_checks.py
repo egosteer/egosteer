@@ -72,7 +72,7 @@ def check_extrinsic_valid(
     """Structural sanity check for a 4x4 homogeneous transform.
 
     Does NOT bound the translation norm (world coordinate frame is arbitrary;
-    chunk-local translation is bounded by check_chunk_translation_valid instead).
+    per-step deltas are bounded by check_state_action_extreme_delta instead).
     """
     if ext.shape != (4, 4):
         raise ExtrinsicInvalidError(f"shape={ext.shape} != (4, 4)")

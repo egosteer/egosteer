@@ -61,8 +61,7 @@ def load_normalizer(path):
 def build_eval_inputs(batch, device, dtype):
     """Extract model inputs from a collated batch for flow inference.
 
-    Mirrors EgoSteerInference.build_model_inputs (flow mode branch).
-    # Source: src/policy/egosteer_inference_wrapper.py#L260-L288
+    Mirrors the batch preparation in EgoSteerInference.prepare_process.
     """
     inputs = {
         "input_ids": batch["input_ids"].to(device),

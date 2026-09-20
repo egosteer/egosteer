@@ -130,7 +130,7 @@ class RuntimeEngine:
         }
 
         if self.warmup_camera_setup_mode == "both":
-            # Warmup should exercise the same multimodal path as production dual-camera requests.
+            # Warmup should exercise the same multimodal path as real dual-camera requests.
             obs["chest_image"] = np.zeros((rgb_meta["horizon"], *self.warmup_image_shape), dtype=np.uint8)
             obs["chest_intrinsic"] = self.warmup_intrinsic.copy()
 

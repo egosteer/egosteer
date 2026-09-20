@@ -39,7 +39,8 @@ fi
 CKPT="$1"; shift
 TRAIN_CFG="$1"; shift
 
+# Hydra single-quotes the values so paths containing '=' (e.g. update_step=10000) parse.
 python evaluate.py \
-    checkpoint_path="$CKPT" \
-    train_config_path="$TRAIN_CFG" \
+    "checkpoint_path='$CKPT'" \
+    "train_config_path='$TRAIN_CFG'" \
     "$@"

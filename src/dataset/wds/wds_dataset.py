@@ -49,8 +49,8 @@ def build_lowdim_slices(cameras):
     return slices
 
 
-# Head-only default with unprefixed "extrinsic"/"intrinsic" aliases so
-# pre-multi-camera audit scripts keep working.
+# Head-only default with unprefixed "extrinsic"/"intrinsic" aliases for
+# backward compatibility with head-only callers.
 def build_legacy_lowdim_slices():
     slices = build_lowdim_slices(["head"])
     slices["extrinsic"] = slices["head_extrinsic"]

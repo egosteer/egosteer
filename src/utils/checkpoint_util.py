@@ -141,15 +141,15 @@ def load_checkpoint(
     *,
     allow_missing_prefixes: tuple[str, ...] = ("frozen_teacher.",),
 ) -> None:
-    """Load model weights from a checkpoint file or Accelerate directory.
+    """Load model weights from a checkpoint file or directory.
 
-    Supports three formats:
+    Supports four formats:
     1. Single file (.pt / .ckpt) — torch.load with key probing.
     2. Native DCP training checkpoint dir (contains .metadata).
        Uses a model-only AppState over torch.distributed.checkpoint.
-    3. Accelerate FSDP2 sharded dir (contains pytorch_model_fsdp_0/).
+    3. FSDP2 sharded dir (contains pytorch_model_fsdp_0/).
        Uses torch.distributed.checkpoint with no_dist=True (PyTorch 2.3+).
-    4. Accelerate safetensors dir — falls back to load_checkpoint_in_model.
+    4. Safetensors dir — all *.safetensors shards are merged and strict-loaded.
 
     The single-file path uses a controlled non-strict load (see
     ``load_state_dict_checked``): keys under ``allow_missing_prefixes`` may be
@@ -205,10 +205,7 @@ def load_checkpoint(
         log.info("Loaded FSDP sharded checkpoint from %s", fsdp_dir)
         return
 
-    # Safetensors / other Accelerate format
-    # Source: accelerate.utils.load_checkpoint_in_model
-    # load_checkpoint_in_model does not support strict mode natively;
-    # load into a temporary state_dict and use strict load_state_dict instead.
+    # Safetensors directory: merge all shards into one state_dict, then strict-load.
     from safetensors.torch import load_file
 
     safetensor_files = sorted(path.glob("*.safetensors"))
@@ -229,7 +226,7 @@ def load_model_and_collator_from_saved_config(
 ):
     """Instantiate model + collator from a training run's saved .hydra/config.yaml.
 
-    Mirrors the loading path in ``evaluate.py::main`` (lines 119-143): load
+    Mirrors the loading path in ``evaluate.py::main``: load
     the training config, instantiate ``cfg.policy``, move to device in the
     target dtype, and instantiate the collator. Use this when the checkpoint
     was trained with options (use_kv_projection, world_model,

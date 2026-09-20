@@ -365,16 +365,13 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
             )
             self.checker.check(image=chest_image, finite={"chest_image": chest_image})
         elif self.load_chest:
-            # load_chest=True means the chest view is required. A missing
-            # chest_image here typically means legacy 'breast'-named data, which
-            # the chest-only loader would otherwise silently degrade to
-            # head-only. Raise a plain ValueError (NOT a DataSkipError) so
-            # attach_sample_ctx re-raises it as a fatal RuntimeError with the
+            # load_chest=True means the chest view is required; do not silently
+            # degrade to head-only. Raise a plain ValueError (NOT a DataSkipError)
+            # so attach_sample_ctx re-raises it as a fatal RuntimeError with the
             # sample locator attached, instead of dropping the sample.
             raise ValueError(
-                "load_chest=True but sample has no 'chest_image': legacy "
-                "'breast'-named data is unreadable by the chest-only loader. "
-                "Rename breast->chest in the data, or set load_chest=False."
+                "load_chest=True but sample has no 'chest_image' member. "
+                "Add chest_image.jpg to the shards, or set load_chest=False."
             )
         # Sample dropout perspective
         active_views = self.sample_active_views(has_chest=chest_image is not None)

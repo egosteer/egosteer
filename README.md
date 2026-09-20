@@ -78,7 +78,7 @@ We also release the trained EgoSteer models below. Use **EgoSteer-3B-Base** as t
 | Model Type | Model Name | Parameters | Description |
 |------------|------------|------------|-------------|
 | **EgoSteer Pretrained** | [EgoSteer-3B-Base](https://huggingface.co/EgoSteer/EgoSteer-3B-Base) | 3B | Base EgoSteer model trained on 9.6k hours of egocentric human videos, ready for fine-tuning |
-| **EgoSteer Generalist** | [EgoSteer-3B-RealMan](https://huggingface.co/EgoSteer/EgoSteer-3B-RealMan) | 3B | A generalist model post-trained on real-world data collected on the RealMan robot |
+| **EgoSteer Generalist** | [EgoSteer-3B-RealMan](https://huggingface.co/EgoSteer/EgoSteer-3B-RealMan) | 3B | A generalist model post-trained on [real-world data collected on the RealMan robot](https://huggingface.co/datasets/EgoSteer/EgoSteer-RealWorld) |
 
 ## Quick Start
 
@@ -146,7 +146,9 @@ For LeRobot datasets, follow [Training with LeRobot Data](#training-with-lerobot
 
 **1. Prepare your data and normalizer.** Convert your data to the EgoSteer
 WebDataset format and compute a normalizer over it. See [`wds.md`](data/wds.md)
-for the shard/sample layout, coordinate conventions, and conversion guide. Then
+for the shard/sample layout, coordinate conventions, and conversion guide; the
+released EgoSteer LeRobot dataset converts with
+[`scripts/lerobot_to_wds.py`](scripts/lerobot_to_wds.py). Then
 point the shard paths in [vla_wds.yaml](src/config/dataset_paths/vla_wds.yaml) to
 your data, and compute the normalizer:
 

@@ -317,7 +317,7 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
         train_dataloader = DeviceTransferWrapper(train_dataloader, device)
         val_dataloader = DeviceTransferWrapper(val_dataloader, device)
 
-        # LR schedule — no accelerate wrapping, so scheduler steps map 1:1 to update steps.
+        # LR schedule: scheduler steps map 1:1 to optimizer update steps.
         grad_accum_steps = int(cfg.training.get("gradient_accumulation_steps", 1))
 
         # steps_per_epoch is configured in optimizer-update steps. The dataloader loop

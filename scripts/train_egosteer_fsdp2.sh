@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Master-only multi-node Accelerate FSDP launcher using pdsh.
+# Master-only multi-node FSDP2 launcher (torchrun via pdsh).
 # Usage: bash scripts/train_egosteer_fsdp2.sh
 
 set -euo pipefail
