@@ -3,7 +3,6 @@ omegaconf
 wandb
 tqdm
 numpy
-zarr  # legacy data build/conversion/visualization utilities
 transformers==5.6.2
 einops
 imageio
@@ -25,3 +24,6 @@ pyarrow>=16  # Released LeRobot v3 metadata and packed 74D frame tables
 av>=15,<17  # RGB and gray12le HEVC depth video decoding
 dill
 psutil
+# scripts/lerobot_to_wds.py (LeRobot -> webdataset conversion)
+av
+pyarrow

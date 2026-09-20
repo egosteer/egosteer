@@ -90,7 +90,7 @@ class Qwen3VLTextAttentionWithKV(Qwen3VLTextAttention):
             value_states,
             attention_mask,
             # Use self.training because base_attention is registered via
-            # object.__setattr__ (line 37) and is not a real submodule, so
+            # object.__setattr__ (see __init__) and is not a real submodule, so
             # wrapper.eval() / .train() does not propagate into it.
             dropout=0.0 if not self.training else base_attention.attention_dropout,
             scaling=base_attention.scaling,

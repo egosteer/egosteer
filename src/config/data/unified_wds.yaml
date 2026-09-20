@@ -78,8 +78,8 @@ dataset:
     # When training does not need depth, skip depth reading entirely at the
     # tar layer (also disables augment_depth downstream).
     load_depth: ${training.train_depth}
-    # Decode chest camera when real-robot shards declare it.
-    # Model side still ignores these keys; set true only once downstream is ready.
+    # Decode the chest camera when shards declare it (dual-camera real-robot
+    # data); see data.md for the dual-camera sample layout.
     load_chest: false
     # Per-sample training-time view dropout for dual-camera samples.
     # Validation and samples without chest video always keep the available views.

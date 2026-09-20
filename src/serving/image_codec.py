@@ -1,9 +1,9 @@
 """JPEG image transport codec for the websocket policy protocol.
 
-Wire format matches EgoSteer-Inference's production client
-(websocket_client.py @ commit 8a2f630): each camera's RGB sequence becomes
-a self-describing dict with `__image_encoding__: "jpeg_sequence"`, plus a
-top-level ``obs["image_compression"]`` metadata key.
+Wire format: each camera's RGB sequence becomes a self-describing dict with
+`__image_encoding__: "jpeg_sequence"`, plus a top-level
+``obs["image_compression"]`` metadata key. The robot-side client in the
+Robot Stack repository emits the same format.
 
 Decode is parallelized across frames with a module-level thread pool
 (cv2.imdecode releases the GIL). Tune with ``EGOSTEER_JPEG_DECODE_WORKERS``;
@@ -32,7 +32,7 @@ def encode_image_field(field: Any, quality: int = 80) -> Any:
 
     Accepts ``(T, H, W, 3)`` or ``(H, W, 3)`` uint8 arrays, or a dict mapping
     camera names to such arrays. Encoder is byte-compatible with the
-    production client.
+    robot-side client.
     """
     if isinstance(field, dict):
         return {k: encode_image_field(v, quality) for k, v in field.items()}
