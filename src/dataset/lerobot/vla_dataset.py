@@ -17,7 +17,6 @@ from ..data_transforms import (
 from .lerobot_dataset import (
     LeRobotEpisodeReader,
     LeRobotDataset,
-    StreamCheckpointCollator,
     WindowConfig,
     camera_parameters,
     read_motion,
@@ -680,17 +679,4 @@ class VLALowLevelLeRobotDataset(VLALeRobotDataset):
 
 
 class UnifiedLeRobotDataset(UnifiedDataset):
-    """Unified LeRobot VLA/VLM stream with joint checkpoint boundaries."""
-
-    # Capture both VLA and VLM cursors at the same consumed-batch boundary.
-    def get_collator(self):
-        collator = super().get_collator()
-        if (
-            self.mode == "train"
-            and self.vlm_dataset is not None
-            and self.vla_dataset.resume_enabled
-        ):
-            if isinstance(collator, StreamCheckpointCollator):
-                collator = collator.collator
-            return StreamCheckpointCollator(collator, stream_names=("vla", "vlm"))
-        return collator
+    """LeRobot VLA stream under the shared unified batching contract."""

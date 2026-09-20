@@ -261,9 +261,8 @@ class TrainEgoSteerWorkspace(BaseWorkspace):
             if use_webloader or not cfg.dataloader.loader.get("in_order", True):
                 raise ValueError("LeRobot data resume requires the plain, in-order DataLoader")
             from src.dataset.lerobot.lerobot_dataset import StreamCheckpoint
-            checkpoint_dataset = dataset.vla_dataset if dataset.vlm_dataset is None else dataset
             self.data_stream = StreamCheckpoint(
-                checkpoint_dataset, batch_size=cfg.dataloader.loader.batch_size,
+                dataset.vla_dataset, batch_size=cfg.dataloader.loader.batch_size,
                 num_workers=cfg.dataloader.loader.num_workers, rank=rank, world_size=world_size,
                 micro_batches_per_epoch=int(cfg.training.get("steps_per_epoch", 100000))
                     * int(cfg.training.get("gradient_accumulation_steps", 1)),

@@ -1,7 +1,7 @@
 # @package _global_
 
 data:
-  # Target image size [H, W] for resizing all RGB images (VLA + VLM) before HF processor.
+  # Target image size [H, W] for resizing RGB images before HF processor.
   # When world model (future frame prediction) is enabled, this MUST be set
   # to ensure temporal attention patches align across frames.
   # Set to null to skip resizing (original resolution preserved).
@@ -9,7 +9,7 @@ data:
   # H * W; used as min_pixels / max_pixels below as a smart_resize fail-safe.
   target_pixels: ${eval:'${data.target_image_size}[0] * ${data.target_image_size}[1]'}
   ignore_index: -100
-  max_vlm_tokens: 1536
+  max_vlm_tokens: 768
   tokenizer_padding: max_length
   depth_clip_range: [0.0, 5.0]
   video_base_fps: 30.0
@@ -74,7 +74,8 @@ dataset:
     video_base_fps: ${data.video_base_fps}
     target_image_size: ${data.target_image_size}
     load_depth: ${training.train_depth}
-    load_chest: true
+    # Decode the chest camera for dual-camera datasets; see lerobot.md.
+    load_chest: false
     view_dropout:
       _target_: src.dataset.data_transforms.ViewDropoutConfig
       drop_head: 0.0
@@ -83,13 +84,13 @@ dataset:
     val_stride: 1
     seed: ${training.seed}
     drop_ratio: 0.8
-    # Per-worker WDS media windows: resize, JPEG quality 80 / depth NPY, shuffle.
+    # Per-worker media windows: resize, JPEG quality 80 / depth NPY, shuffle.
     shuffle_buffer: 16384
     shuffle_initial: 4096
     resume_warmup_samples: 4096  # Future shuffle selections to predecode on resume
     reader_kwargs:
       row_group_cache_size: 8
-      frame_cache_size: 183  # Per active video: head + chest RGB cache up to 366 frames
+      frame_cache_size: 183  # Per active video: RGB cache covers a full window
       video_reader_cache_size: 4
   vlm_dataset: null
   vla_ratio: 1
@@ -143,15 +144,15 @@ dataloader:
     use_webloader: false
     cross_worker_shuffle: 0
   loader:
-    batch_size: 8
+    batch_size: 18
     num_workers: 4
     pin_memory: True
     persistent_workers: True
-    prefetch_factor: 2
+    prefetch_factor: 4
 
 val_dataloader:
   loader:
-    batch_size: 8
+    batch_size: 18
     shuffle: False
     drop_last: False
     num_workers: 4

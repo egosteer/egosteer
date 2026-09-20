@@ -1,7 +1,7 @@
 """LeRobot pipeline utilities for EgoSteer training.
 
 Provides field mappings, Parquet/video readers, resumable episode streams
-and shared VLA/VLM dataset lifecycle and checkpoint handling.
+and VLA dataset lifecycle and checkpoint handling.
 """
 
 import hashlib
@@ -173,15 +173,7 @@ class WindowConfig:
 
 # Post-shuffle media stage: materialize JPEG/NPY refs before checks and augmentation.
 def decode_sample_media(sample):
-    """Decode VLA frame windows or VLM image fields after shuffle."""
-    if "image_frame_refs" not in sample:
-        from PIL import Image
-
-        for key, value in list(sample.items()):
-            if key.startswith("image_") and key.endswith(".jpg"):
-                sample[key] = Image.open(io.BytesIO(value)).convert("RGB")
-        return sample
-
+    """Decode frame window media after shuffle."""
     for refs_key, fields in (
         (
             "image_frame_refs",
@@ -249,7 +241,6 @@ def encode_frame(array, target_size=None):
 class LeRobotEpisodeReader:
     """Read one episode split with projected Parquet columns and worker-local caches."""
 
-    is_vla = True
     episode_columns = EPISODE_COLUMNS
     video_keys = VIDEO_KEYS
 
@@ -281,12 +272,10 @@ class LeRobotEpisodeReader:
         }
         self.data_template = self.info["data_path"]
         self.video_template = self.info["video_path"] if self.video_keys else None
-        self.tasks = {}
-        if self.is_vla:
-            rows = pq.read_table(
-                self.root / "meta/tasks.parquet", columns=["task_index", "task"]
-            ).to_pylist()
-            self.tasks = {int(row["task_index"]): row["task"] for row in rows}
+        rows = pq.read_table(
+            self.root / "meta/tasks.parquet", columns=["task_index", "task"]
+        ).to_pylist()
+        self.tasks = {int(row["task_index"]): row["task"] for row in rows}
         self.episodes = self._read_episodes()
         self.data_paths = [
             str(
@@ -346,13 +335,10 @@ class LeRobotEpisodeReader:
                     or row["dataset_to_index"] - row["dataset_from_index"] != row["length"]
                 ):
                     raise ValueError(f"episode {eid}: invalid length/global index interval")
-                if self.is_vla:
-                    for field, shape in CALIBRATION_SHAPES.items():
-                        row[field] = np.asarray(row[field], dtype=np.float64).reshape(shape)
+                for field, shape in CALIBRATION_SHAPES.items():
+                    row[field] = np.asarray(row[field], dtype=np.float64).reshape(shape)
                 for key in self.video_keys:
                     prefix = f"videos/{key}"
-                    if not self.is_vla and row.get(f"{prefix}/file_index") is None:
-                        continue
                     first, last = (
                         float(row[f"{prefix}/{side}_timestamp"]) for side in ("from", "to")
                     )
@@ -855,7 +841,7 @@ def build_lerobot_pipeline(dataset, global_worker, total_workers, logical_worker
                 if mixed:
                     state["mix_rng"] = mix_rng.bit_generator.state
                 data = StreamSample(data)
-                data.stream_state, data.stream_name = state, dataset.stream_name
+                data.stream_state = state
             yield data
     finally:
         clear_restore_cache()
@@ -947,7 +933,7 @@ def dataset_fingerprint(dataset, collator_config):
 
 
 class StreamCheckpoint:
-    """Track consumed batches for one stream or a fixed-ratio VLA/VLM pair."""
+    """Track consumed batches for one resumable stream."""
 
     def __init__(
         self,
@@ -968,20 +954,8 @@ class StreamCheckpoint:
             or (micro_batches_per_epoch is not None and micro_batches_per_epoch < 1)
         ):
             raise ValueError("invalid stream loader topology")
-        self.mixed = getattr(dataset, "vlm_dataset", None) is not None
-        self.batch_size = int(batch_size)
-        if self.mixed:
-            self.vla_ratio = float(dataset.vla_ratio)
-            vla_count = math.ceil(batch_size * self.vla_ratio)
-            if not 0 < vla_count < batch_size or dataset.batch_size != batch_size:
-                raise ValueError(
-                    "mixed dataset requires matching batch size and nonempty VLA/VLM quotas"
-                )
-            self.datasets = {"vla": dataset.vla_dataset, "vlm": dataset.vlm_dataset}
-            sizes = {"vla": vla_count, "vlm": batch_size - vla_count}
-        else:
-            self.datasets = {dataset.stream_name: dataset}
-            sizes = {dataset.stream_name: batch_size}
+        self.datasets = {dataset.stream_name: dataset}
+        sizes = {dataset.stream_name: batch_size}
         self.rank_key = f"rank_{int(rank)}"
         self.consumed_batches = 0
         self.specs, self.workers = {}, {}
@@ -1011,7 +985,7 @@ class StreamCheckpoint:
     # Advance checkpoint ownership only after training consumes a batch, not when workers prefetch.
     def record_consumed(self, encoded):
         state = pickle.loads(encoded)
-        states = state.get("streams", {}) if self.mixed else {next(iter(self.datasets)): state}
+        states = {next(iter(self.datasets)): state}
         if set(states) != set(self.datasets):
             raise ValueError("batch stream names disagree with the configured datasets")
         nw = max(1, self.spec["num_workers"])
@@ -1040,32 +1014,12 @@ class StreamCheckpoint:
             streams[name] = {
                 self.rank_key: pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
             }
-        if not self.mixed:
-            return next(iter(streams.values()))
-        payload = {
-            "format": "vla_vlm_v1",
-            "batch_size": self.batch_size,
-            "vla_ratio": self.vla_ratio,
-            "streams": streams,
-        }
-        return {self.rank_key: pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)}
+        return next(iter(streams.values()))
 
     # Validate every stream before installing worker cursors and the next delivery position.
     def load_state_dict(self, state):
         payload = pickle.loads(state[self.rank_key])
-        if self.mixed:
-            if (
-                payload.get("format") != "vla_vlm_v1"
-                or payload["batch_size"] != self.batch_size
-                or payload["vla_ratio"] != self.vla_ratio
-            ):
-                raise ValueError("mixed stream checkpoint format or VLA/VLM ratio mismatch")
-            payloads = {
-                name: pickle.loads(item[self.rank_key])
-                for name, item in payload["streams"].items()
-            }
-        else:
-            payloads = {next(iter(self.datasets)): payload}
+        payloads = {next(iter(self.datasets)): payload}
         if set(payloads) != set(self.datasets):
             raise ValueError("checkpoint stream names disagree with the configured datasets")
         counts = {int(item["consumed_batches"]) for item in payloads.values()}
@@ -1106,16 +1060,12 @@ class StreamCheckpoint:
 class StreamCheckpointCollator:
     """Freeze worker state before the next prefetch can mutate the live queue."""
 
-    def __init__(self, collator, stream_names=None):
+    def __init__(self, collator):
         self.collator = collator
-        self.stream_names = stream_names
 
     # Freeze the live worker queue before prefetch advances it to the next batch.
     def __call__(self, samples):
         state = samples[-1].stream_state
-        if self.stream_names is not None:
-            streams = {sample.stream_name: sample.stream_state for sample in samples}
-            state = {"worker_id": state["worker_id"], "streams": streams}
         result = self.collator(samples)
         result[STREAM_STATE_KEY] = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
         return result
