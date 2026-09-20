@@ -172,6 +172,17 @@ training:
   normalizer_path: /path/to/your/normalizer.pkl
 ```
 
+Training-time RTC makes the robot's executed trajectory smoother across action
+chunks. To enable it, set the following in
+[qwen3_vl_2b.yaml](src/config/model/qwen3_vl_2b.yaml):
+
+```yaml
+policy:
+  rtc_config:
+    enabled: True        # keep off for pretraining; turn on for real-robot fine-tuning
+    max_delay: 6         # longest executed-action prefix sampled during training
+```
+
 EgoSteer trains on an infinite WebDataset stream, so run length is measured in optimizer update steps rather than data epochs. The same `training` section also sets the run length, learning-rate schedule, evaluation interval, and checkpoint interval; follow the inline comments there.
 
 **4. Launch training.**
