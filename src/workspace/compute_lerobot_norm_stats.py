@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. lerobot_root=/data/EgoSteer-RealWorld")
+    parser.add_argument("overrides", nargs="*", help="Hydra overrides, e.g. lerobot_root=/path/to/lerobot_dataset")
     args = parser.parse_args()
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     OmegaConf.register_new_resolver("now", lambda fmt: datetime.now().strftime(fmt), replace=True)

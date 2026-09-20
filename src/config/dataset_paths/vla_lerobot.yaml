@@ -1,6 +1,6 @@
 # @package _global_
 # A root path or a list of {root, weight, split?, val_split?} sources.
 # Multiple sources mix before one shared shuffle buffer; weights default to 1.
-lerobot_root: /share_data/yifan/EgoSteer-RealWorld
+lerobot_root: /path/to/lerobot_dataset
 lerobot_train_split: train
 lerobot_val_split: val

@@ -108,8 +108,8 @@ format. `scripts/lerobot_to_wds.py` converts it into the WebDataset shards above
 
 ```bash
 pip install av pyarrow          # in addition to requirements.txt
-python scripts/lerobot_to_wds.py --root /path/EgoSteer-RealWorld --out /path/EgoSteer-RealWorld.wds --workers 32
-python scripts/verify_wds.py    --wds  /path/EgoSteer-RealWorld.wds --root /path/EgoSteer-RealWorld
+python scripts/lerobot_to_wds.py --root /path/to/EgoSteer-RealWorld --out /path/to/EgoSteer-RealWorld.wds --workers 32
+python scripts/verify_wds.py    --wds  /path/to/EgoSteer-RealWorld.wds --root /path/to/EgoSteer-RealWorld
 ```
 
 - Episodes are shuffled with `--seed` (default 0) and packed **whole** into shards of about
