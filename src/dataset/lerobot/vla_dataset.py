@@ -151,8 +151,6 @@ class VLALeRobotDataset(LeRobotDataset):
             raise ValueError("training split has no anchors with a next state")
 
     def _validate_config(self):
-        if self.motion_type != "fingertips" or self.action_ndim != 48 or self.hand_ndim != 15:
-            raise ValueError("release adapter feeds the existing 48D fingertip model")
         cfg = self.window_config
         windows = (
             (cfg.action_horizon, cfg.action_stride),
@@ -455,14 +453,6 @@ class VLALeRobotDataset(LeRobotDataset):
                         "instruction_num",
                         "image",
                     ),
-                    "expected_last_dim": {
-                        "wrist_state": 18,
-                        "hand_state": 30,
-                        "wrist_action": 18,
-                        "hand_action": 30,
-                        "extrinsic": 16,
-                        "intrinsic": 4,
-                    },
                 },
             )
         )
@@ -649,13 +639,6 @@ class VLALowLevelLeRobotDataset(VLALeRobotDataset):
                         "hand_action",
                         "extrinsic",
                     ),
-                    "expected_last_dim": {
-                        "wrist_state": 18,
-                        "hand_state": 30,
-                        "wrist_action": 18,
-                        "hand_action": 30,
-                        "extrinsic": 16,
-                    },
                 },
             )
         )

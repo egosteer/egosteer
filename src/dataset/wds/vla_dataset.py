@@ -266,14 +266,6 @@ class VLAWdsDataset(torch.utils.data.IterableDataset):
                         "instruction_num",
                         "image",
                     ),
-                    "expected_last_dim": {
-                        "wrist_state": 18,
-                        "hand_state": 30,
-                        "wrist_action": 18,
-                        "hand_action": 30,
-                        "extrinsic": 16,
-                        "intrinsic": 4,
-                    },
                 },
             )
         )
@@ -676,13 +668,6 @@ class VLALowLevelWdsDataset(torch.utils.data.IterableDataset):
                         "hand_action",
                         "extrinsic",
                     ),
-                    "expected_last_dim": {
-                        "wrist_state": 18,
-                        "hand_state": 30,
-                        "wrist_action": 18,
-                        "hand_action": 30,
-                        "extrinsic": 16,
-                    },
                 },
             )
         )

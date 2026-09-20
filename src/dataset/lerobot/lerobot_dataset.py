@@ -77,8 +77,6 @@ def camera_parameters(reader, e, indices, cameras):
     for camera, column in zip(cameras, columns):
         intrinsic = reader.episodes[e][f"calibration.{camera}_intrinsics"]
         poses = np.stack(table[column].to_numpy()[positions]).astype(np.float32, copy=False)
-        if poses.shape != (len(indices), 16):
-            raise ValueError(f"{column} must contain flattened 4x4 matrices")
         result[camera] = intrinsic[[0, 1, 0, 1], [0, 1, 2, 2]].astype(np.float32), poses
     return result
 
@@ -310,9 +308,6 @@ class LeRobotEpisodeReader:
         self.fps = float(self.info["fps"])
         if not np.isfinite(self.fps) or self.fps <= 0:
             raise ValueError("info.json fps must be positive")
-        # Layout is fixed; sample values are checked by DataChecker after shuffle.
-        if self.info["features"]["observation.state"]["shape"] != [74]:
-            raise ValueError("observation.state must declare the released 74D layout")
 
     # Project metadata before split selection so large stats columns never enter memory.
     def _read_episodes(self):
