@@ -49,8 +49,7 @@ its episode metadata. A file may contain multiple episodes.
 | `high_quality` | optional, default `1` | DAgger flag: `1` = human-intervention frame, `0` = model-execution frame. Scalar or single-element 0/1 or boolean values. |
 
 Training targets read the recorded **`action`** column at each target frame
-before coordinate transforms and normalization. The final frame cannot start
-a training window.
+before coordinate transforms and normalization.
 
 ### State and action layout
 

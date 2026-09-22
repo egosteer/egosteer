@@ -50,8 +50,8 @@ class VLALeRobotDataset(LeRobotDataset):
     """Sequential LeRobot windows with EgoSteer's shared transforms and collator.
 
     Workers own disjoint episodes and shuffle compressed windows. Action targets
-    are the recorded action column; the final frame cannot anchor a window.
-    Train and val use the episode splits in the same root's info.json.
+    are the recorded action column, so every frame can anchor a window. Train
+    and val use the episode splits in the same root's info.json.
     """
 
     lowdim_only = False
@@ -167,7 +167,7 @@ class VLALeRobotDataset(LeRobotDataset):
         return sum(self.num_anchors(e) for e in range(len(self.episodes)))
 
     def num_anchors(self, e):
-        return max(0, int(self.episodes[e]["length"]) - 1)
+        return int(self.episodes[e]["length"])
 
     # Assemble state history and recorded action targets from one episode.
     # DAgger checks quality on each target frame's own row.
@@ -178,8 +178,8 @@ class VLALeRobotDataset(LeRobotDataset):
         episode = reader.episodes[e]
         cfg = self.window_config
         length = int(episode["length"])
-        if not 0 <= k < length - 1:
-            raise IndexError("anchor must have a successor within its episode")
+        if not 0 <= k < length:
+            raise IndexError("anchor is outside its episode")
         action_times = range(
             k, k + cfg.action_horizon * cfg.action_stride, cfg.action_stride
         )
