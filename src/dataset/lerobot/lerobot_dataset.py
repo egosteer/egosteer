@@ -81,10 +81,10 @@ def camera_parameters(reader, e, indices, cameras):
     return result
 
 
-# Read history and next-state targets together, preserving requested frame order.
-def read_motion(reader, e, indices):
-    """Read measured 74D states and map them to wrist18/fingertips30."""
-    table = reader.read_table(e, indices, ["observation.state", "task_index"])
+# Read motion vectors at the requested frames, preserving requested frame order.
+def read_motion(reader, e, indices, column="observation.state"):
+    """Read 74D vectors and map them to wrist18/fingertips30."""
+    table = reader.read_table(e, indices, [column, "task_index"])
     episode = reader.episodes[e]
     tasks = (
         reader.tasks.get(int(index)) for index in np.unique(np.asarray(table["task_index"]))
@@ -95,7 +95,7 @@ def read_motion(reader, e, indices):
     order = np.argsort(frame_ids)
     positions = order[np.searchsorted(frame_ids[order], indices)]
     # Arrow yields NumPy row views; avoid boxing every float through to_pylist().
-    values = np.stack(table["observation.state"].to_numpy()[positions]).astype(
+    values = np.stack(table[column].to_numpy()[positions]).astype(
         np.float32, copy=False
     )
     left, right = values[:, 26:35], values[:, 35:44]

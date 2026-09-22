@@ -50,8 +50,8 @@ class VLALeRobotDataset(LeRobotDataset):
     """Sequential LeRobot windows with EgoSteer's shared transforms and collator.
 
     Workers own disjoint episodes and shuffle compressed windows. Action targets
-    are next measured states; the final frame has no successor. Train and val
-    use the episode splits in the same root's info.json.
+    are the recorded action column; the final frame cannot anchor a window.
+    Train and val use the episode splits in the same root's info.json.
     """
 
     lowdim_only = False
@@ -148,7 +148,7 @@ class VLALeRobotDataset(LeRobotDataset):
         if any(not np.isclose(reader.fps, self.video_base_fps) for reader in self.readers):
             raise ValueError("video_base_fps must match info.json fps")
         if self.mode == "train" and not len(self):
-            raise ValueError("training split has no anchors with a next state")
+            raise ValueError("training split has no usable anchors")
 
     def _validate_config(self):
         cfg = self.window_config
@@ -169,8 +169,8 @@ class VLALeRobotDataset(LeRobotDataset):
     def num_anchors(self, e):
         return max(0, int(self.episodes[e]["length"]) - 1)
 
-    # Assemble state history and next-state action targets from one episode.
-    # DAgger checks quality at action time t, while the target value comes from state[t+1].
+    # Assemble state history and recorded action targets from one episode.
+    # DAgger checks quality on each target frame's own row.
     def read_window(self, e, k, load_media=True, compressed=False):
         """Build the raw wrist/hand window consumed by sample_to_data."""
         source_id, e = self.episode_sources[e]
@@ -179,9 +179,9 @@ class VLALeRobotDataset(LeRobotDataset):
         cfg = self.window_config
         length = int(episode["length"])
         if not 0 <= k < length - 1:
-            raise IndexError("anchor must have a next state within its episode")
+            raise IndexError("anchor must have a successor within its episode")
         action_times = range(
-            k + 1, k + 1 + cfg.action_horizon * cfg.action_stride, cfg.action_stride
+            k, k + cfg.action_horizon * cfg.action_stride, cfg.action_stride
         )
         future_times = range(
             k + cfg.future_frame_stride,
@@ -193,11 +193,11 @@ class VLALeRobotDataset(LeRobotDataset):
             self.dagger_quality_filter
             and "high_quality" in reader.columns[reader.data_paths[e]]
         ):
-            # Action target state[t+1] uses quality from the preceding row t.
+            # Action target action[t] uses the quality flag of its own row t.
             indices = sorted(
                 {
                     k,
-                    *(i - 1 for i in action_times if i < length),
+                    *(i for i in action_times if i < length),
                     *(i for i in future_times if i < length),
                 }
             )
@@ -213,13 +213,13 @@ class VLALeRobotDataset(LeRobotDataset):
             k, cfg.state_horizon, cfg.state_stride, cfg.history_pad_mode
         )
         action_ids = future_indices(
-            action_times, length, cfg.action_pad_mode, quality, quality_offset=-1
+            action_times, length, cfg.action_pad_mode, quality
         )
         future_ids = future_indices(future_times, length, cfg.future_frame_pad_mode, quality)
-        # Query measured states once; the future slice supplies next-state targets.
-        wrist, hand = read_motion(reader, e, state_ids + action_ids)
-        wrist_state, wrist_action = wrist[: len(state_ids)], wrist[len(state_ids) :]
-        hand_state, hand_action = hand[: len(state_ids)], hand[len(state_ids) :]
+        # States come from observation.state; action targets from the recorded
+        # action column at the same target frames.
+        wrist_state, hand_state = read_motion(reader, e, state_ids)
+        wrist_action, hand_action = read_motion(reader, e, action_ids, column="action")
         sample = {
             "wrist_state": wrist_state,
             "hand_state": hand_state,

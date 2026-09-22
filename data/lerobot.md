@@ -38,7 +38,7 @@ its episode metadata. A file may contain multiple episodes.
 | Field | Type / shape | Content |
 |---|---|---|
 | `observation.state` | `float32 [74]` | Measured state, using the layout below. |
-| `action` | `float32 [74]` | Recorded command in the same layout. Training targets use the next measured state. |
+| `action` | `float32 [74]` | Recorded command in the same layout; used directly as the training target. |
 | `timestamp` | `float32` | Episode-relative time in seconds: `frame_index / fps`. |
 | `frame_index` | `int64` | Frame number within the episode, starting at 0. |
 | `episode_index` | `int64` | Episode identifier. |
@@ -48,9 +48,9 @@ its episode metadata. A file may contain multiple episodes.
 | `observation.camera.chest_world2cam` | `float32 [16]` | Current frame's world-to-chest-camera transform; read when chest loading is enabled. |
 | `high_quality` | optional, default `1` | DAgger flag: `1` = human-intervention frame, `0` = model-execution frame. Scalar or single-element 0/1 or boolean values. |
 
-Training uses **`action[t] = observation.state[t+1]`** before coordinate
-transforms and normalization. The final frame supplies a target state but
-cannot start a training window.
+Training targets read the recorded **`action`** column at each target frame
+before coordinate transforms and normalization. The final frame cannot start
+a training window.
 
 ### State and action layout
 

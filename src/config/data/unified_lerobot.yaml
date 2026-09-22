@@ -68,8 +68,7 @@ dataset:
     shape_meta: ${data.shape_meta}
     use_relative_action: true
     dagger_quality_filter: ${data.dagger_quality_filter}
-    # Before relative conversion, training action[t] is observation.state[t+1].
-    # The native on-disk action column is not used as a training target.
+    # Before relative conversion, training targets use the recorded action column.
     depth_clip_range: ${data.depth_clip_range}
     video_base_fps: ${data.video_base_fps}
     target_image_size: ${data.target_image_size}
