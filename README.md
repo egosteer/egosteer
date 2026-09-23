@@ -25,6 +25,12 @@ This repository contains **EgoSteer**, a **world-model-enhanced** Vision-Languag
   <img src="assets/model-arch.png" alt="EgoSteer model architecture" width="100%">
 </p>
 
+## News
+
+- **2026-09-23**: Native LeRobot v3 datasets are supported for training. See [Training with LeRobot Data](#training-with-lerobot-data).
+- **2026-09-15**: Released [EgoSteer-RealWorld](https://huggingface.co/datasets/EgoSteer/EgoSteer-RealWorld), the real-robot dataset collected on the RealMan robot.
+- **2026-06-23**: Released the [EgoSteer-3B-Base](https://huggingface.co/EgoSteer/EgoSteer-3B-Base) and [EgoSteer-3B-RealMan](https://huggingface.co/EgoSteer/EgoSteer-3B-RealMan) checkpoints.
+
 ## Installation
 
 Clone the repository first, then set up an environment for training or inference:
