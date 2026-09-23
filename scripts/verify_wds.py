@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Check that a WebDataset directory satisfies the loader contract in data/data.md.
 
-For every shard: each frame has exactly image.jpg, chest_image.jpg, lowdim.npy,
-meta.json in that order; frames of an episode are contiguous and numbered
-0..N-1; meta fields are valid; lowdim is float32[136]. Across shards: no
+For every shard: each frame has image.jpg, [chest_image.jpg], lowdim.npy, meta.json in that order (depth members
+optional, see data/wds.md); frames of an episode are contiguous and numbered 0..N-1; meta fields are valid;
+meta["cameras"] starts with "head" and matches the members present; lowdim is float32[96 + 20 * cameras]
+(116 head-only, 136 head + chest). Across shards: no
 episode appears in more than one shard, and each shard holds exactly the
 episodes recorded for it in <split>/index.json (written by lerobot_to_wds.py).
 With --root, every episode of the LeRobot dataset must be present with the
@@ -21,7 +22,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-MEMBERS = ["image.jpg", "chest_image.jpg", "lowdim.npy", "meta.json"]
+ORDER = ["image.jpg", "depth.npy", "chest_image.jpg", "chest_depth.npy", "lowdim.npy", "meta.json"]   # contract order
+REQUIRED = {"image.jpg", "lowdim.npy", "meta.json"}
+CAMERA_MEMBER = {"head": "image.jpg", "chest": "chest_image.jpg"}
 
 
 def check_shard(path):
@@ -33,7 +36,7 @@ def check_shard(path):
 
 
 def _check_shard(path):
-    episodes, current, expected_frame, suffixes = {}, None, 0, []
+    episodes, current, expected_frame, suffixes, lowdim_len, shard_members = {}, None, 0, [], None, None
     with tarfile.open(path) as tar:
         for member in tar:
             key, suffix = member.name.split(".", 1)
@@ -41,16 +44,24 @@ def _check_shard(path):
             if suffix != "meta.json":
                 if suffix == "lowdim.npy":
                     vec = np.load(io.BytesIO(tar.extractfile(member).read()))
-                    assert vec.dtype == np.float32 and vec.shape == (136,), f"{path}:{member.name} lowdim {vec.dtype}{vec.shape}"
+                    assert vec.dtype == np.float32 and vec.ndim == 1, f"{path}:{member.name} lowdim {vec.dtype}{vec.shape}"
+                    lowdim_len = vec.shape[0]
                 continue
-            assert suffixes == MEMBERS, f"{path}:{key} members {suffixes}"
+            assert REQUIRED <= set(suffixes) and suffixes == [m for m in ORDER if m in suffixes], f"{path}:{key} members {suffixes}"
+            if shard_members is None:
+                shard_members = suffixes
+            assert suffixes == shard_members, f"{path}:{key} members {suffixes} differ from the shard's {shard_members}"
+            present = suffixes
             suffixes = []
             meta = json.load(tar.extractfile(member))
             episode, frame = int(key.split("_")[1]), int(key.split("_")[3])
             assert meta["episode_index"] == episode, f"{path}:{key} meta episode_index {meta['episode_index']}"
             assert meta["instruction_num"] == len(meta["instruction"]) > 0, f"{path}:{key} instruction_num mismatch"
             assert all(isinstance(s, str) and s.strip() for s in meta["instruction"]), f"{path}:{key} empty instruction"
-            assert meta["cameras"] == ["head", "chest"], f"{path}:{key} cameras {meta['cameras']}"
+            cams = meta.get("cameras", ["head"])
+            assert cams[:1] == ["head"] and all(c in CAMERA_MEMBER for c in cams), f"{path}:{key} cameras {cams}"
+            assert [c for c in CAMERA_MEMBER if CAMERA_MEMBER[c] in present] == cams, f"{path}:{key} cameras {cams} but members {present}"
+            assert lowdim_len == 96 + 20 * len(cams), f"{path}:{key} lowdim has {lowdim_len} values, expected {96 + 20 * len(cams)} for cameras {cams}"
             if episode != current:
                 assert episode not in episodes, f"{path}: episode {episode} is not contiguous"
                 current, expected_frame = episode, 0
@@ -99,7 +110,10 @@ def main():
     if args.root:
         rows = []
         for p in sorted((args.root / "meta" / "episodes").rglob("*.parquet")):
-            rows += pq.read_table(p, columns=["episode_index", "length", "split"]).to_pylist()
+            present = pq.read_schema(p).names
+            rows += pq.read_table(p, columns=[c for c in ("episode_index", "length", "split") if c in present]).to_pylist()
+        for r in rows:
+            r.setdefault("split", "train")           # no split column: everything is train
         mismatch = [r for r in rows if per_split.get(r["split"], {}).get(r["episode_index"]) != r["length"]]
         for r in mismatch:
             print(f"BAD episode {r['episode_index']} ({r['split']}): wds {per_split.get(r['split'], {}).get(r['episode_index'])} frames, lerobot {r['length']}")

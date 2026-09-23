@@ -12,6 +12,9 @@ Every frame is one sample with four members:
     episode_000123_frame_000045.lowdim.npy       float32[136], see to_lowdim()
     episode_000123_frame_000045.meta.json        instruction / instruction_num / episode_index / dataset_name / cameras
 
+Datasets without a chest camera (the EgoSteer-Egocentric human datasets, after their head video has been re-attached)
+get the head-only form of the contract: image.jpg only, lowdim.npy with 116 values, cameras = ["head"].
+
 Episodes are shuffled with a fixed seed and packed *whole* into shards, so each
 shard mixes tasks and no episode is ever split across two shards. The loader
 relies on that: it cuts temporal windows at episode boundaries inside a shard.
@@ -23,7 +26,8 @@ Usage:
 Re-running skips shards that already exist, so an interrupted run can resume.
 To spread the work over several machines that share the output directory, give
 each one a different --part k/N: machine k writes the shards whose index % N == k.
-Requires numpy, pyarrow, av (PyAV) and Pillow.
+Requires numpy, pyarrow, av (PyAV) and Pillow. A labels-only dataset (no head video) cannot be converted: re-attach
+the video first.
 """
 import argparse
 import io
@@ -34,7 +38,6 @@ import time
 from multiprocessing import Pool
 from pathlib import Path
 
-import av
 import numpy as np
 import pyarrow.parquet as pq
 from PIL import Image
@@ -55,12 +58,20 @@ def load_episodes(root):
                    f"videos/{cam}/from_timestamp", f"videos/{cam}/to_timestamp"]
     rows = []
     for path in sorted((root / "meta" / "episodes").rglob("*.parquet")):
-        rows += pq.read_table(path, columns=wanted).to_pylist()
+        present = pq.read_schema(path).names          # chest columns are absent on head-only datasets
+        rows += pq.read_table(path, columns=[c for c in wanted if c in present]).to_pylist()
     return sorted(rows, key=lambda r: r["episode_index"])
 
 
-def read_lowdim_rows(root, info, ep):
-    """(state, action, head_world2cam, chest_world2cam) float32 arrays for one episode.
+def cameras(info, ep):
+    """Cameras the episode has video for, head first: ["head", "chest"] on robot data, ["head"] on human data."""
+    cams = [cam for cam in ("head", "chest") if info.get("video_path") and ep.get(f"videos/observation.images.{cam}/chunk_index") is not None]
+    assert cams[:1] == ["head"], f"episode {ep['episode_index']}: no head video (labels-only dataset? re-attach the video first)"
+    return cams
+
+
+def read_lowdim_rows(root, info, ep, cams=("head", "chest")):
+    """(state, action, <world2cam of each camera in cams>) float32 arrays for one episode.
 
     The dataset writes one parquet row group per episode, so only that row
     group is read instead of the whole file.
@@ -70,12 +81,12 @@ def read_lowdim_rows(root, info, ep):
     for rg in range(pf.num_row_groups):
         first = pf.read_row_group(rg, columns=["episode_index"]).column(0)[0].as_py()
         if first == ep["episode_index"]:
-            table = pf.read_row_group(rg, columns=["episode_index", "observation.state", "action", *WORLD2CAM.values()])
+            table = pf.read_row_group(rg, columns=["episode_index", "observation.state", "action", *(WORLD2CAM[c] for c in cams)])
             break
     else:
         raise KeyError(f"episode {ep['episode_index']} not found in {path}")
     assert set(table.column("episode_index").to_pylist()) == {ep["episode_index"]}, "row group holds more than one episode"
-    columns = [np.asarray(table.column(c).to_pylist(), dtype=np.float32) for c in ("observation.state", "action", *WORLD2CAM.values())]
+    columns = [np.asarray(table.column(c).to_pylist(), dtype=np.float32) for c in ("observation.state", "action", *(WORLD2CAM[c] for c in cams))]
     assert len(columns[0]) == ep["length"], f"episode {ep['episode_index']}: {len(columns[0])} rows, expected {ep['length']}"
     return columns
 
@@ -86,6 +97,8 @@ def decode_video(root, info, ep, cam):
     Every episode starts on a keyframe, so seeking to from_timestamp and
     decoding until to_timestamp returns exactly the episode's frames.
     """
+    import av
+
     path = root / info["video_path"].format(video_key=cam, chunk_index=ep[f"videos/{cam}/chunk_index"],
                                            file_index=ep[f"videos/{cam}/file_index"])
     t0, t1 = ep[f"videos/{cam}/from_timestamp"], ep[f"videos/{cam}/to_timestamp"]
@@ -104,13 +117,13 @@ def decode_video(root, info, ep, cam):
 
 # ----------------------------------------------------------------------------- sample encoding
 
-def to_lowdim(state, action, head_world2cam, chest_world2cam, head_K, chest_K):
-    """Map one frame of the 74-dim LeRobot state/action to the 136-dim lowdim vector.
+def to_lowdim(state, action, head_world2cam, chest_world2cam, head_K, chest_K=None):
+    """Map one frame of the 74-dim LeRobot state/action to the lowdim vector: 136 dims with a chest camera, 116 without.
 
     LeRobot layout: [arm_L(7) arm_R(7) hand_L(6) hand_R(6) wrist_L(9) wrist_R(9) tips_L(15) tips_R(15)]
     where wrist = [xyz(3) rot6d(6)] in the head-camera (world) frame.
     lowdim layout: wrist_state(18) hand_state(30) wrist_action(18) hand_action(30)
-                   head_extrinsic(16) head_intrinsic(4) chest_extrinsic(16) chest_intrinsic(4)
+                   head_extrinsic(16) head_intrinsic(4) [chest_extrinsic(16) chest_intrinsic(4)]
     The extrinsics are the frame's world2cam matrices (4x4, row-major) as stored in the dataset.
     """
     def wrist(v):
@@ -119,8 +132,10 @@ def to_lowdim(state, action, head_world2cam, chest_world2cam, head_K, chest_K):
     def intrinsic(K):   # K is a row-major 3x3 -> [fx, fy, cx, cy]
         return [K[0], K[4], K[2], K[5]]
 
-    return np.concatenate([wrist(state), state[44:74], wrist(action), action[44:74],
-                           head_world2cam, intrinsic(head_K), chest_world2cam, intrinsic(chest_K)]).astype(np.float32)
+    parts = [wrist(state), state[44:74], wrist(action), action[44:74], head_world2cam, intrinsic(head_K)]
+    if chest_K is not None:
+        parts += [chest_world2cam, intrinsic(chest_K)]
+    return np.concatenate(parts).astype(np.float32)
 
 
 def jpeg_bytes(rgb, quality):
@@ -141,8 +156,8 @@ def plan_shards(episodes, frames_per_shard, seed):
     """{split: [[episode, ...], ...]}: shuffle episodes per split, then pack them whole."""
     rng = np.random.default_rng(seed)
     plan = {}
-    for split in sorted({e["split"] for e in episodes}):
-        pool = [e for e in episodes if e["split"] == split]
+    for split in sorted({e.get("split", "train") for e in episodes}):   # no split column: everything is train
+        pool = [e for e in episodes if e.get("split", "train") == split]
         pool = [pool[i] for i in rng.permutation(len(pool))]
         shards, current, frames = [], [], 0
         for ep in pool:
@@ -169,18 +184,21 @@ def write_shard(job):
             tar.addfile(member, io.BytesIO(data))
 
         for ep in episodes:
-            state, action, head_world2cam, chest_world2cam = read_lowdim_rows(root, info, ep)
+            cams = cameras(info, ep)
+            state, action, *world2cam = read_lowdim_rows(root, info, ep, cams)
+            has_chest = "chest" in cams
             meta = {"instruction": list(ep["instructions"]), "instruction_num": len(ep["instructions"]),
-                    "episode_index": ep["episode_index"], "dataset_name": ep["tasks"][0], "cameras": ["head", "chest"]}
+                    "episode_index": ep["episode_index"], "dataset_name": ep["tasks"][0], "cameras": cams}
             meta_json = json.dumps(meta, ensure_ascii=False).encode("utf-8")
-            frames = zip(decode_video(root, info, ep, HEAD), decode_video(root, info, ep, CHEST))
+            frames = zip(*(decode_video(root, info, ep, f"observation.images.{cam}") for cam in cams))
             decoded = 0
-            for t, (head, chest) in enumerate(frames):
+            for t, images in enumerate(frames):
                 key = f"episode_{ep['episode_index']:06d}_frame_{t:06d}"
-                add(key + ".image.jpg", jpeg_bytes(head, quality))
-                add(key + ".chest_image.jpg", jpeg_bytes(chest, quality))
-                add(key + ".lowdim.npy", npy_bytes(to_lowdim(state[t], action[t], head_world2cam[t], chest_world2cam[t],
-                                                              ep["calibration/head_intrinsics"], ep["calibration/chest_intrinsics"])))
+                add(key + ".image.jpg", jpeg_bytes(images[0], quality))
+                if has_chest:
+                    add(key + ".chest_image.jpg", jpeg_bytes(images[1], quality))
+                add(key + ".lowdim.npy", npy_bytes(to_lowdim(state[t], action[t], world2cam[0][t], world2cam[1][t] if has_chest else None,
+                                                              ep["calibration/head_intrinsics"], ep.get("calibration/chest_intrinsics") if has_chest else None)))
                 add(key + ".meta.json", meta_json)
                 decoded += 1
             assert decoded == ep["length"], f"episode {ep['episode_index']}: decoded {decoded} frames, expected {ep['length']}"
