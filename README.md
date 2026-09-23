@@ -27,7 +27,7 @@ This repository contains **EgoSteer**, a **world-model-enhanced** Vision-Languag
 
 ## News
 
-- **2026-09-23**: **📦 Dataset release:** our egocentric human pretraining dataset, with **10,000 hours curated from 100,000 hours of raw videos** using [EgoSmith](https://github.com/egosteer/egosmith), is open-sourced on Hugging Face as [**EgoSteer/EgoSteer-Egocentric**](https://huggingface.co/datasets/EgoSteer/EgoSteer-Egocentric) (LeRobot v3 format; annotations only).
+- **2026-09-23**: **📦 Dataset release:** our egocentric human pretraining dataset, with **9.6k hours curated from 100k+ hours of raw videos** using [EgoSmith](https://github.com/egosteer/egosmith), is open-sourced on Hugging Face as [**EgoSteer/EgoSteer-Egocentric**](https://huggingface.co/datasets/EgoSteer/EgoSteer-Egocentric) (LeRobot v3 format; annotations only).
 - **2026-09-23**: **🛠️ Training update:** native LeRobot v3 datasets are now supported for training. See [**Training with LeRobot Data**](#training-with-lerobot-data).
 - **2026-09-15**: **📦 Dataset release:** the 192-hour, 193-task real-robot dataset collected with [Robot Stack](https://github.com/egosteer/robot-stack) for EgoSteer post-training is open-sourced on Hugging Face as [**EgoSteer/EgoSteer-RealWorld**](https://huggingface.co/datasets/EgoSteer/EgoSteer-RealWorld) (LeRobot v3 format).
 - **2026-06-23**: **🚀 Model release:** our pretrained [**EgoSteer-3B-Base**](https://huggingface.co/EgoSteer/EgoSteer-3B-Base) and post-trained [**EgoSteer-3B-RealMan**](https://huggingface.co/EgoSteer/EgoSteer-3B-RealMan) checkpoints are open-sourced on Hugging Face.
