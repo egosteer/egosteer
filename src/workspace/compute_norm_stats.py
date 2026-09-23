@@ -20,7 +20,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from src.dataset.normalizer_utils import get_normalizer
-from src.dataset.vla_dataset import VLALowLevelWdsDataset
+from src.dataset.wds.vla_dataset import VLALowLevelWdsDataset
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 OmegaConf.register_new_resolver(

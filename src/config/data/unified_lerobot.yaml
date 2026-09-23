@@ -1,7 +1,7 @@
 # @package _global_
 
 data:
-  # Target image size [H, W] for resizing all RGB images (VLA + VLM) before HF processor.
+  # Target image size [H, W] for resizing RGB images before HF processor.
   # When world model (future frame prediction) is enabled, this MUST be set
   # to ensure temporal attention patches align across frames.
   # Set to null to skip resizing (original resolution preserved).
@@ -13,9 +13,7 @@ data:
   tokenizer_padding: max_length
   depth_clip_range: [0.0, 5.0]
   video_base_fps: 30.0
-  # DAgger: drop hq=0 anchor windows; suffix-truncate action/WM at first hq=0.
-  # Missing high_quality key defaults to 1 (no-op on legacy data).
-  dagger_quality_filter: true
+  dagger_quality_filter: true  # Optional per-frame Parquet high_quality; missing means 1
   sanity_checks:
     rot6d:
       orthogonality_threshold: 0.1
@@ -60,42 +58,39 @@ data:
       pad_mode: repeat
 
 dataset:
-  _target_: src.dataset.wds.vla_dataset.UnifiedWdsDataset
+  # LeRobot stream using the shared batching contract.
+  _target_: src.dataset.lerobot.vla_dataset.UnifiedLeRobotDataset
   vla_dataset:
-    _target_: src.dataset.wds.vla_dataset.VLAWdsDataset
-    wds_datasets: ${vla_wds_datasets}
+    _target_: src.dataset.lerobot.vla_dataset.VLALeRobotDataset
+    root: ${lerobot_root}
+    split: ${lerobot_train_split}
+    val_split: ${lerobot_val_split}
     shape_meta: ${data.shape_meta}
-    use_relative_action: True
+    use_relative_action: true
+    dagger_quality_filter: ${data.dagger_quality_filter}
+    # Before relative conversion, training targets use the recorded action column.
     depth_clip_range: ${data.depth_clip_range}
-    val_wds_datasets: ${val_vla_wds_datasets}
-    shuffle_buffer: 16384
-    # Warmup samples required before the train shuffle yields anything.
-    # Keep much smaller than shuffle_buffer when keep_ratio < 1.0; otherwise
-    # startup must read roughly shuffle_buffer / keep_ratio candidates per worker.
-    shuffle_initial: 4096
     video_base_fps: ${data.video_base_fps}
     target_image_size: ${data.target_image_size}
-    # When training does not need depth, skip depth reading entirely at the
-    # tar layer (also disables augment_depth downstream).
     load_depth: ${training.train_depth}
-    # Decode the chest camera when shards declare it (dual-camera real-robot
-    # data); see data.md for the dual-camera sample layout.
+    # Decode the chest camera for dual-camera datasets; see lerobot.md.
     load_chest: false
-    # Per-sample training-time view dropout for dual-camera samples.
-    # Validation and samples without chest video always keep the available views.
     view_dropout:
       _target_: src.dataset.data_transforms.ViewDropoutConfig
       drop_head: 0.0
       drop_chest: 0.0
-    # Pre-shuffle Bernoulli keep rate (train only). Lower = more shard diversity,
-    # higher IO. 1.0 disables. Ref: DreamZero shard_sampling_rate.
-    keep_ratio: 0.2
-    # Val only: score every N-th window. 1 = full val set.
-    val_stride: 1
     sanity_checks: ${data.sanity_checks}
-    dagger_quality_filter: ${data.dagger_quality_filter}
-  # VLM branch disabled for the example (VLA-only training).
-  # UnifiedWdsDataset streams pure VLA when vlm_dataset is None.
+    val_stride: 1
+    seed: ${training.seed}
+    drop_ratio: 0.8
+    # Per-worker media windows: resize, JPEG quality 80 / depth NPY, shuffle.
+    shuffle_buffer: 16384
+    shuffle_initial: 4096
+    resume_warmup_samples: 4096  # Future shuffle selections to predecode on resume
+    reader_kwargs:
+      row_group_cache_size: 8
+      frame_cache_size: 183  # Per active video: RGB cache covers a full window
+      video_reader_cache_size: 4
   vlm_dataset: null
   vla_ratio: 1
   batch_size: ${dataloader.loader.batch_size}

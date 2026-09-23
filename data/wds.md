@@ -1,4 +1,6 @@
-# Data
+# WebDataset Data
+
+For LeRobot datasets, see [lerobot.md](lerobot.md).
 
 This document describes the EgoSteer data format and how to convert your own
 data into it. To train on the small example dataset first, see the
@@ -106,8 +108,8 @@ format. `scripts/lerobot_to_wds.py` converts it into the WebDataset shards above
 
 ```bash
 pip install av pyarrow          # in addition to requirements.txt
-python scripts/lerobot_to_wds.py --root /path/EgoSteer-RealWorld --out /path/EgoSteer-RealWorld.wds --workers 32
-python scripts/verify_wds.py    --wds  /path/EgoSteer-RealWorld.wds --root /path/EgoSteer-RealWorld
+python scripts/lerobot_to_wds.py --root /path/to/EgoSteer-RealWorld --out /path/to/EgoSteer-RealWorld.wds --workers 32
+python scripts/verify_wds.py    --wds  /path/to/EgoSteer-RealWorld.wds --root /path/to/EgoSteer-RealWorld
 ```
 
 - Episodes are shuffled with `--seed` (default 0) and packed **whole** into shards of about
@@ -202,7 +204,7 @@ These three `*_ratings` are per-turn quality scores carried over from [FineVisio
    ```yaml
    dataset:
      vlm_dataset:
-       _target_: src.dataset.vlm_dataset.VLMWdsDataset
+       _target_: src.dataset.wds.vlm_dataset.VLMWdsDataset
        wds_datasets: ${vlm_wds_datasets}
        val_wds_datasets: ${val_vlm_wds_datasets}
        weights: [0.5, 0.5, 0.5]

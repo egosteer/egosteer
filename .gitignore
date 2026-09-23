@@ -160,6 +160,7 @@ hostfile
 
 # test files
 _test
+/tests/
 
 .pylintrc
 

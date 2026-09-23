@@ -1,6 +1,6 @@
-'''
+"""
 WebDataset-based VLM dataset for EgoSteer training.
-'''
+"""
 
 import time
 import warnings
@@ -10,7 +10,7 @@ import numpy as np
 from src.utils.pytorch_util import dict_apply
 from src.dataset.data_transforms import process_image
 from src.dataset.sanity_checks import DataChecker, MissingOrInvalidFilesError
-from src.dataset.wds_dataset import build_blended_dataset
+from src.dataset.wds.wds_dataset import build_blended_dataset
 
 
 class VLMWdsDataset(torch.utils.data.IterableDataset):
@@ -20,12 +20,13 @@ class VLMWdsDataset(torch.utils.data.IterableDataset):
     VLM samples are resized to `target_image_size` and use the standard
     single-image path (vision_type='image').
     """
+
     def __init__(
         self,
         wds_datasets: List[Dict],
         weights: List[float] = [0.5, 0.5, 0.5],
         seed: int = 42,
-        mode: str = 'train',
+        mode: str = "train",
         shuffle_buffer: int = 16384,
         shuffle_initial: Optional[int] = None,
         return_dataset_info: bool = False,
@@ -46,9 +47,7 @@ class VLMWdsDataset(torch.utils.data.IterableDataset):
         self.collator = None
         self.sanity_checks = dict(sanity_checks or {})
         self.checker = DataChecker(sanity_cfg=self.sanity_checks)
-        self.target_image_size = (
-            tuple(target_image_size) if target_image_size is not None else None
-        )
+        self.target_image_size = tuple(target_image_size) if target_image_size is not None else None
         assert 0.0 < keep_ratio <= 1.0, f"keep_ratio must be in (0, 1], got {keep_ratio}"
         self.keep_ratio = float(keep_ratio)
 
@@ -64,6 +63,7 @@ class VLMWdsDataset(torch.utils.data.IterableDataset):
         assert self.collator is not None, "Collator is not set"
         from copy import deepcopy
         from src.dataset.unified_vla_collator import UnifiedVLACollator
+
         return UnifiedVLACollator(
             formatter=self.collator.formatter,
             batch_processor=deepcopy(self.collator.batch_processor),
@@ -79,7 +79,7 @@ class VLMWdsDataset(torch.utils.data.IterableDataset):
             wds_datasets=self.val_wds_datasets,
             weights=self.weights,
             seed=self.seed,
-            mode='val' if self.mode == 'train' else self.mode,
+            mode="val" if self.mode == "train" else self.mode,
             shuffle_buffer=0,
             return_dataset_info=self.return_dataset_info,
             val_wds_datasets=self.val_wds_datasets,
@@ -93,90 +93,94 @@ class VLMWdsDataset(torch.utils.data.IterableDataset):
 
     def sample_to_data(self, sample):
         """Convert one WDS sample to model-ready fields."""
-        self.checker.check(sample_schema=(sample, {
-            "required_keys": ("meta.json",),
-            "required_meta_keys": (
-                "texts",
-                "formatting_ratings",
-                "visual_dependency_ratings",
-                "relevance_ratings",
-            ),
-        }))
+        self.checker.check(
+            sample_schema=(
+                sample,
+                {
+                    "required_keys": ("meta.json",),
+                    "required_meta_keys": (
+                        "texts",
+                        "formatting_ratings",
+                        "visual_dependency_ratings",
+                        "relevance_ratings",
+                    ),
+                },
+            )
+        )
 
-        meta = sample['meta.json']
+        meta = sample["meta.json"]
 
-        image_keys = sorted([
-            k for k in sample.keys()
-            if k.startswith("image_") and k.endswith(".jpg")
-        ])
+        image_keys = sorted(
+            [k for k in sample.keys() if k.startswith("image_") and k.endswith(".jpg")]
+        )
         if not image_keys:
             raise MissingOrInvalidFilesError("missing required image_*.jpg fields")
         images = [sample[k] for k in image_keys]
 
-        text = meta['texts']
+        text = meta["texts"]
         weights = self.weights
 
         formatting_ratings = np.array(
-            [r if r is not None else 0 for r in meta['formatting_ratings']]
+            [r if r is not None else 0 for r in meta["formatting_ratings"]]
         )
         visual_dependency_ratings = np.array(
-            [r if r is not None else 0 for r in meta['visual_dependency_ratings']]
+            [r if r is not None else 0 for r in meta["visual_dependency_ratings"]]
         )
-        relevance_ratings = np.array(
-            [r if r is not None else 0 for r in meta['relevance_ratings']]
-        )
+        relevance_ratings = np.array([r if r is not None else 0 for r in meta["relevance_ratings"]])
 
         if len(text) > 1:
-            scores = (formatting_ratings * weights[0]
-                      + visual_dependency_ratings * weights[1]
-                      + relevance_ratings * weights[2])
+            scores = (
+                formatting_ratings * weights[0]
+                + visual_dependency_ratings * weights[1]
+                + relevance_ratings * weights[2]
+            )
             text = text[np.argmax(scores)]
         else:
             text = text[0]
-        question = str(text['user'])
-        answer = str(text['assistant'])
+        question = str(text["user"])
+        answer = str(text["assistant"])
         self.checker.check(instruction=(question, 1))
 
         raw_images = []
         for img_pil in images:
-            if img_pil.mode != 'RGB':
-                img_pil = img_pil.convert('RGB')
+            if img_pil.mode != "RGB":
+                img_pil = img_pil.convert("RGB")
             raw_images.append(np.array(img_pil, dtype=np.uint8))
         images_arr = np.stack(raw_images, dtype=np.uint8)
 
         # Always resize: dynamic aspect ratios cause vision-tower recompiles.
         images_processed, _, _ = process_image(
             images_arr,
-            aug_transform=(self.mode == 'train'),
+            aug_transform=(self.mode == "train"),
             target_size=self.target_image_size,
         )
-        self.checker.check(finite={'images_processed': images_processed})
+        self.checker.check(finite={"images_processed": images_processed})
 
         data = {
-            'images': images_processed,
-            'question': question,
-            'answer': answer,
-            'vision_type': 'image',
-            'is_vla_data': np.array(False, dtype=bool),
-            'view_mask': np.array([False, False], dtype=bool),
+            "images": images_processed,
+            "question": question,
+            "answer": answer,
+            "vision_type": "image",
+            "is_vla_data": np.array(False, dtype=bool),
+            "view_mask": np.array([False, False], dtype=bool),
         }
 
         if self.return_dataset_info:
-            data['dataset_name'] = meta.get('source', meta.get('dataset_name', 'unknown'))
-            data['episode_index'] = np.array(
-                meta.get('sample_idx', -1), dtype=np.int32
-            )
+            data["dataset_name"] = meta.get("source", meta.get("dataset_name", "unknown"))
+            data["episode_index"] = np.array(meta.get("sample_idx", -1), dtype=np.int32)
         self.checker.check(finite=data)
         return data
 
     def build_pipeline(self):
         datasets_config = []
         for ds in self.wds_datasets:
-            datasets_config.append({
-                "shard_urls": ds["shard_urls"],
-                "weight": ds.get("weight", 1.0),
-                "name": ds.get("name", "unknown"),
-            })
+            datasets_config.append(
+                {
+                    "shard_urls": ds["shard_urls"],
+                    "weight": ds.get("weight", 1.0),
+                    "name": ds.get("name", "unknown"),
+                }
+            )
 
         def preprocess_fn(sample):
             # DataSkipError -> attach_sample_ctx logs and drops the sample;

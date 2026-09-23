@@ -405,24 +405,12 @@ def check_sample_schema(
     sample: Mapping[str, Any],
     *,
     required_keys: tuple[str, ...],
-    expected_last_dim: Mapping[str, int] | None = None,
     required_meta_keys: tuple[str, ...] = (),
 ) -> None:
-    """Check sample-level required fields, simple dimensions, and meta keys."""
+    """Check sample-level required fields and meta keys."""
     for key in required_keys:
         if key not in sample or sample.get(key) is None:
             raise MissingOrInvalidFilesError(f"missing required field: {key}")
-
-    if expected_last_dim:
-        for key, dim in expected_last_dim.items():
-            value = sample.get(key)
-            if value is None:
-                continue
-            arr = np.asarray(value)
-            if arr.ndim == 0 or arr.shape[-1] != int(dim):
-                raise MissingOrInvalidFilesError(
-                    f"invalid {key} shape={tuple(arr.shape)} expected last_dim={int(dim)}"
-                )
 
     if required_meta_keys:
         meta = sample.get("meta.json")
@@ -771,7 +759,6 @@ class DataChecker:
         check_sample_schema(
             sample=sample,
             required_keys=tuple(cfg.get("required_keys", ())),
-            expected_last_dim=cfg.get("expected_last_dim", None),
             required_meta_keys=tuple(cfg.get("required_meta_keys", ())),
         )
 

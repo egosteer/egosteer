@@ -88,7 +88,7 @@ The fastest way to verify your setup is to train on the small example dataset.
 is hosted on [Google Drive](https://drive.google.com/file/d/1iBPKZrHYjw3kmC0XYHfj7mpcElmBtCBR/view?usp=sharing)
 and contains both VLA and VLM dataset shards. It ships no normalizer, so you
 compute it in step 2. Quick Start trains on the VLA shards only. For the VLM
-data format and how to enable VLA + VLM joint training, see [`data.md`](data/data.md).
+data format and how to enable VLA + VLM joint training, see [`wds.md`](data/wds.md).
 
 ```bash
 # Option A: Command Line (gdown handles the Google Drive confirmation step)
@@ -142,8 +142,10 @@ environment variables, and uses [numa_bind_wrapper.sh](scripts/numa_bind_wrapper
 To adapt EgoSteer to your own data or embodiment, fine-tune from the released
 **EgoSteer-3B-Base** weights.
 
+For LeRobot datasets, follow [Training with LeRobot Data](#training-with-lerobot-data) below.
+
 **1. Prepare your data and normalizer.** Convert your data to the EgoSteer
-WebDataset format and compute a normalizer over it. See [`data.md`](data/data.md)
+WebDataset format and compute a normalizer over it. See [`wds.md`](data/wds.md)
 for the shard/sample layout, coordinate conventions, and conversion guide; the
 released EgoSteer LeRobot dataset converts with
 [`scripts/lerobot_to_wds.py`](scripts/lerobot_to_wds.py). Then
@@ -217,6 +219,32 @@ your platform actually exports, then set it as the container start command:
 bash scripts/train_egosteer_fsdp2_cloud.sh
 ```
 
+### Training with LeRobot Data
+
+EgoSteer also supports LeRobot v3 datasets with the field layout described in
+[lerobot.md](data/lerobot.md). Set the dataset root and split names in
+[vla_lerobot.yaml](src/config/dataset_paths/vla_lerobot.yaml), then compute the normalizer:
+
+```bash
+python -m src.workspace.compute_lerobot_norm_stats \
+  --output_dir outputs/normalizer/lerobot \
+  lerobot_root=/path/to/lerobot_dataset
+```
+
+Select the [LeRobot experiment](src/config/experiment/egosteer_lerobot.yaml) to fine-tune:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train.py \
+  experiment=egosteer_lerobot \
+  lerobot_root=/path/to/lerobot_dataset \
+  training.finetune_checkpoint_path=/path/to/model_bf16.pt \
+  training.normalizer_path=outputs/normalizer/lerobot/normalizer.pkl
+```
+
+Set `--nproc_per_node` to the number of GPUs to use. To use the launch scripts
+above instead, change their `ARGS` assignment to `ARGS="experiment=egosteer_lerobot"`
+and set the data and checkpoint paths in the configuration files.
+
 ### Resuming Training
 
 To resume an interrupted run from one of its own DCP checkpoint directories,
@@ -228,8 +256,12 @@ training:
   resume_checkpoint_path: /path/to/checkpoint        # a DCP checkpoint directory
 ```
 
-Unlike fine-tuning, resuming restores the full training state, namely the model,
-optimizer, LR schedule, and step counter, so the run continues exactly where it stopped.
+Resuming reloads the full training state — model, optimizer, LR schedule, and
+step counter (fine-tuning above loads model weights only). With LeRobot datasets
+it additionally restores the data stream position and RNG state, so the run
+continues exactly where it stopped. The WDS stream cannot restore its position:
+resuming a WDS run reloads the training state above but restarts data loading
+from a fresh shuffle.
 
 ### Checkpoint Layout
 

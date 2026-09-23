@@ -18,17 +18,17 @@ import numpy as np
 import webdataset as wds
 from webdataset.tariterators import base_plus_ext
 
-from .sanity_checks import attach_sample_ctx, build_sample_context
+from ..sanity_checks import attach_sample_ctx, build_sample_context
 
 
 # lowdim.npy layout: base 96D (wrist/hand state+action) + 20D per camera
 # (extrinsic 16 + intrinsic 4) appended in meta["cameras"] order.
 # cameras[0] is always "head"; legacy shards with no cameras field are head-only.
 BASE_LOWDIM_SLICES = {
-    'wrist_state':  (0, 18),
-    'hand_state':   (18, 48),
-    'wrist_action': (48, 66),
-    'hand_action':  (66, 96),
+    "wrist_state": (0, 18),
+    "hand_state": (18, 48),
+    "wrist_action": (48, 66),
+    "hand_action": (66, 96),
 }
 BASE_LOWDIM_LEN = 96
 CAMERA_BLOCK_SIZE = 20
@@ -43,8 +43,8 @@ def build_lowdim_slices(cameras):
     slices = dict(BASE_LOWDIM_SLICES)
     offset = BASE_LOWDIM_LEN
     for cam in cameras:
-        slices[f'{cam}_extrinsic'] = (offset, offset + 16)
-        slices[f'{cam}_intrinsic'] = (offset + 16, offset + 20)
+        slices[f"{cam}_extrinsic"] = (offset, offset + 16)
+        slices[f"{cam}_intrinsic"] = (offset + 16, offset + 20)
         offset += CAMERA_BLOCK_SIZE
     return slices
 
@@ -63,7 +63,9 @@ LOWDIM_SLICES = build_legacy_lowdim_slices()
 
 def _is_shard_sequence(shard_patterns):
     """Return True when *shard_patterns* is a non-string sequence of shard entries."""
-    return isinstance(shard_patterns, Sequence) and not isinstance(shard_patterns, (str, bytes, os.PathLike))
+    return isinstance(shard_patterns, Sequence) and not isinstance(
+        shard_patterns, (str, bytes, os.PathLike)
+    )
 
 
 def _is_glob_pattern(shard_entry):
@@ -107,6 +109,7 @@ def expand_shard_patterns(shard_patterns):
 @dataclass
 class WindowConfig:
     """Sampling window parameters for sliding window compose."""
+
     action_horizon: int = 32
     action_stride: int = 1
     state_horizon: int = 16
@@ -136,7 +139,7 @@ class WindowConfig:
             (self.state_horizon - 1) * self.state_stride,
             (self.image_horizon - 1) * self.image_stride,
         )
-    
+
     @property
     def future_size(self):
         """Number of future frames (including current) needed for action + future frame prediction."""
@@ -149,6 +152,7 @@ def decode_sample_fields(sample):
     """Eagerly decode meta.json and lowdim.npy; leave image/depth as bytes
     for post-shuffle decoding."""
     import io as _io
+
     meta = sample.get("meta.json")
     if isinstance(meta, bytes):
         sample["meta.json"] = json.loads(meta.decode("utf-8"))
@@ -167,6 +171,7 @@ def decode_media_fields(sample):
     """
     from PIL import Image
     import io as _io
+
     for key in list(sample.keys()):
         val = sample[key]
         if not isinstance(val, bytes):
@@ -211,8 +216,7 @@ def gather_history_frames(past, buf, horizon, stride, pad_mode):
     return frames
 
 
-def gather_future_refs(buf, horizon, stride, pad_mode, offset_base=0,
-                       *, quality_truncate=False):
+def gather_future_refs(buf, horizon, stride, pad_mode, offset_base=0, *, quality_truncate=False):
     """Gather future frame references from the sliding window buffer.
 
     Unified helper for both action-chunk and future-frame gathering.
@@ -264,33 +268,39 @@ def build_sample_from_window(buf, past, config):
 
     # Action chunk: len(lowdims_full) is the valid count.
     action_refs, _ = gather_future_refs(
-        buf, config.action_horizon, config.action_stride, config.action_pad_mode,
+        buf,
+        config.action_horizon,
+        config.action_stride,
+        config.action_pad_mode,
         offset_base=0,
         quality_truncate=config.dagger_quality_filter,
     )
     lowdims_full = np.stack([frame["lowdim.npy"] for frame in action_refs], axis=0)
 
     state_frames = gather_history_frames(
-        past, buf, config.state_horizon, config.state_stride, config.history_pad_mode)
+        past, buf, config.state_horizon, config.state_stride, config.history_pad_mode
+    )
     state_lds = np.stack([f["lowdim.npy"] for f in state_frames], axis=0)
 
     image_frames = gather_history_frames(
-        past, buf, config.image_horizon, config.image_stride, config.history_pad_mode)
+        past, buf, config.image_horizon, config.image_stride, config.history_pad_mode
+    )
     image_frame_refs = tuple(image_frames)
 
     future_frame_refs = None
     future_lowdims = None
     if config.future_frame_horizon > 0:
         ff_refs, _ = gather_future_refs(
-            buf, config.future_frame_horizon, config.future_frame_stride,
-            config.future_frame_pad_mode, offset_base=config.future_frame_stride,
+            buf,
+            config.future_frame_horizon,
+            config.future_frame_stride,
+            config.future_frame_pad_mode,
+            offset_base=config.future_frame_stride,
             quality_truncate=config.dagger_quality_filter,
         )
         if ff_refs:
             future_frame_refs = tuple(ff_refs)
-            future_lowdims = np.stack(
-                [frame["lowdim.npy"] for frame in ff_refs], axis=0
-            )
+            future_lowdims = np.stack([frame["lowdim.npy"] for frame in ff_refs], axis=0)
 
     # head_* map to canonical extrinsic/intrinsic; chest_* pass through.
     ld = current["lowdim.npy"]
@@ -307,18 +317,20 @@ def build_sample_from_window(buf, past, config):
         elif field in ("chest_extrinsic", "chest_intrinsic"):
             result[field] = ld[s:e].astype(np.float32)
 
-    result.update({
-        "instruction": meta["instruction"],
-        "instruction_num": meta["instruction_num"],
-        # 1=left, 2=right, 3=both; human datasets only.
-        "presence": int(meta.get("presence", 3)),
-        "dataset_name": meta.get("dataset_name", ""),
-        "episode_index": meta.get("episode_index", 0),
-        # Propagate webdataset locators so downstream skip logs can pinpoint
-        # the exact tar shard + current-frame key for offline triage.
-        "shard_url": current.get("__url__", ""),
-        "__key__": current.get("__key__", ""),
-    })
+    result.update(
+        {
+            "instruction": meta["instruction"],
+            "instruction_num": meta["instruction_num"],
+            # 1=left, 2=right, 3=both; human datasets only.
+            "presence": int(meta.get("presence", 3)),
+            "dataset_name": meta.get("dataset_name", ""),
+            "episode_index": meta.get("episode_index", 0),
+            # Propagate webdataset locators so downstream skip logs can pinpoint
+            # the exact tar shard + current-frame key for offline triage.
+            "shard_url": current.get("__url__", ""),
+            "__key__": current.get("__key__", ""),
+        }
+    )
 
     result["image_frame_refs"] = image_frame_refs
     if future_frame_refs is not None:
@@ -353,6 +365,7 @@ def decode_depth_bytes(raw):
     """Decode a single depth map from raw npy bytes or numpy array."""
     if isinstance(raw, bytes):
         import io
+
         return np.load(io.BytesIO(raw))
     return np.array(raw, copy=True)
 
@@ -382,7 +395,9 @@ def materialize_sample_media(sample):
     future_refs = sample.pop("future_frame_refs", None)
     if future_refs is not None:
         stack_optional(sample, "future_frames", future_refs, "image.jpg", decode_image_bytes)
-        stack_optional(sample, "chest_future_frames", future_refs, "chest_image.jpg", decode_image_bytes)
+        stack_optional(
+            sample, "chest_future_frames", future_refs, "chest_image.jpg", decode_image_bytes
+        )
 
     return sample
 
@@ -417,18 +432,14 @@ def sliding_window_compose(src, config):
         try:
             return build_sample_from_window(buf, past, config)
         except Exception as e:
-            raise RuntimeError(
-                f"data error on {build_sample_context(current)}"
-            ) from e
+            raise RuntimeError(f"data error on {build_sample_context(current)}") from e
 
     for sample in src:
         try:
             meta = sample["meta.json"]
             ep_key = (meta.get("dataset_name", ""), meta["episode_index"])
         except Exception as e:
-            raise RuntimeError(
-                f"data error on {build_sample_context(sample)}"
-            ) from e
+            raise RuntimeError(f"data error on {build_sample_context(sample)}") from e
 
         if ep_key != cur_ep:
             # Episode boundary: flush with clamped actions.
@@ -494,18 +505,27 @@ def build_select_files(load_image: bool, load_depth: bool, load_chest: bool):
         # base_plus_ext returns (None, None) for unsplittable names;
         # let wds handle those itself instead of dropping silently.
         return suffix is None or suffix in allowed
+
     return predicate
 
 
-def build_wds_pipeline(shard_urls, config=None,
-                       load_image=True, load_depth=False, load_chest=False,
-                       preprocess_fn=None, shuffle_buffer=16384, shuffle_initial=None,
-                       mode='train',
-                       use_sliding_window=True,
-                       include_post_stages=True,
-                       keep_ratio: float = 1.0,
-                       val_stride: int = 1,
-                       *, checker):
+def build_wds_pipeline(
+    shard_urls,
+    config=None,
+    load_image=True,
+    load_depth=False,
+    load_chest=False,
+    preprocess_fn=None,
+    shuffle_buffer=16384,
+    shuffle_initial=None,
+    mode="train",
+    use_sliding_window=True,
+    include_post_stages=True,
+    keep_ratio: float = 1.0,
+    val_stride: int = 1,
+    *,
+    checker,
+):
     """Build a WebDataset pipeline for a single dataset.
 
     Train: resampled infinite stream with shard-level shuffle.
@@ -548,11 +568,10 @@ def build_wds_pipeline(shard_urls, config=None,
     shard_urls, shard_patterns_metadata = expand_shard_patterns(shard_urls)
     assert shard_urls, f"No shards found: {shard_patterns_metadata}"
 
-    is_train = (mode == 'train')
+    is_train = mode == "train"
     # VLM uses image_N.jpg with variable N; skip tar-level filter.
     select_files = (
-        build_select_files(load_image, load_depth, load_chest)
-        if use_sliding_window else None
+        build_select_files(load_image, load_depth, load_chest) if use_sliding_window else None
     )
 
     # resampled=True's ResampledShards already gives per-worker/node
@@ -586,10 +605,12 @@ def build_wds_pipeline(shard_urls, config=None,
         # Shuffle holds lightweight window descriptors (frame refs), not
         # decoded images.
         if is_train and shuffle_buffer and shuffle_buffer > 0:
-            stages.append(wds.shuffle(
-                shuffle_buffer, 
-                initial=resolve_shuffle_initial(shuffle_buffer, shuffle_initial), 
-            ))
+            stages.append(
+                wds.shuffle(
+                    shuffle_buffer,
+                    initial=resolve_shuffle_initial(shuffle_buffer, shuffle_initial),
+                )
+            )
 
         if use_sliding_window:
             stages.append(attach_sample_ctx(materialize_sample_media, checker=checker))
@@ -602,14 +623,22 @@ def build_wds_pipeline(shard_urls, config=None,
     return wds.DataPipeline(*stages)
 
 
-def build_blended_dataset(datasets_config, config=None,
-                          load_image=True, load_depth=False, load_chest=False,
-                          preprocess_fn=None, shuffle_buffer=16384, shuffle_initial=None,
-                          mode='train',
-                          use_sliding_window=True,
-                          keep_ratio: float = 1.0,
-                          val_stride: int = 1,
-                          *, checker):
+def build_blended_dataset(
+    datasets_config,
+    config=None,
+    load_image=True,
+    load_depth=False,
+    load_chest=False,
+    preprocess_fn=None,
+    shuffle_buffer=16384,
+    shuffle_initial=None,
+    mode="train",
+    use_sliding_window=True,
+    keep_ratio: float = 1.0,
+    val_stride: int = 1,
+    *,
+    checker,
+):
     """Build a blended dataset from multiple WebDataset sources.
 
     Train: per-subset pipelines mixed via RandomMix, then one shared
@@ -636,7 +665,7 @@ def build_blended_dataset(datasets_config, config=None,
     if config is None:
         config = WindowConfig()
 
-    is_train = (mode == 'train')
+    is_train = mode == "train"
 
     subsets = []
     weights = []
@@ -645,7 +674,8 @@ def build_blended_dataset(datasets_config, config=None,
         # Train: subsets emit raw samples; shuffle/materialize/preprocess
         # run once after RandomMix.
         pipe = build_wds_pipeline(
-            urls, config,
+            urls,
+            config,
             load_image=load_image,
             load_depth=load_depth,
             load_chest=load_chest,
@@ -665,9 +695,11 @@ def build_blended_dataset(datasets_config, config=None,
     assert subsets, "No shards found across all datasets."
 
     if not is_train:
+
         def chain_pipelines():
             for pipe in subsets:
                 yield from pipe
+
         return chain_pipelines()
 
     # RandomMix is an IterableDataset, not FluidInterface; wrap in
@@ -676,10 +708,12 @@ def build_blended_dataset(datasets_config, config=None,
 
     stages = [mixed]
     if shuffle_buffer and shuffle_buffer > 0:
-        stages.append(wds.shuffle(
-            shuffle_buffer,
-            initial=resolve_shuffle_initial(shuffle_buffer, shuffle_initial),
-        ))
+        stages.append(
+            wds.shuffle(
+                shuffle_buffer,
+                initial=resolve_shuffle_initial(shuffle_buffer, shuffle_initial),
+            )
+        )
 
     if use_sliding_window:
         stages.append(attach_sample_ctx(materialize_sample_media, checker=checker))
